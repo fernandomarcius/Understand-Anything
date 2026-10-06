@@ -245,7 +245,9 @@ Writes `<memberRoot>/.ua/contracts.json` (data dir rule applies). Runs on files 
   ],
   "consumers": [            // outbound HTTP calls
     { "kind": "http", "method": "GET", "path": "/Operacoes/elegiveis",        // path relative to the base, template-normalized; may be null if unknown
-      "base": { "type": "env|config|literal|unknown", "name": "REACT_APP_API_GESTAO_OPERACAO", "value": null, "suffix": "" },
+      "base": { "type": "env|config|literal|unknown", "name": "REACT_APP_API_GESTAO_OPERACAO", "value": null, "suffix": "",
+                "fallbacks": ["REACT_APP_API_X"],          // optional: other env names from `A || B`
+                "transform": { "stripSuffix": "/api" } },  // optional: see "Base transforms" below
       "via": "superagent-wrapper|axios|axios.create|fetch|requests|httpx|HttpClient|typed-client|helper",
       "file": "src/api/operacaoApi.js", "line": 17, "confidence": 0.9 }
   ],
@@ -274,6 +276,24 @@ Secrets: env values that look like credentials (keys named `*KEY*`, `*SECRET*`, 
 store `"value": null, "redacted": true`. Only URL-like values (scheme://host[:port][/path]) and
 bare host:port are kept.
 
+### Base transforms (`consumer.base.transform`, optional)
+
+Present when the base was derived from the env/config base by a string transform before the path
+was appended (e.g. `const RAIZ = API_ROOT.replace(/\/api$/, '')`, then `${RAIZ}/Relatorio/X`). It
+describes what happens to the **base's own path** (the env value's path), which only the linker knows:
+
+- `{ "stripSuffix": "/api" }` — drop that trailing path. From `.replace(/\/api$/, '')` (also through
+  `` `${API_ROOT}`.replace(...) `` and helper functions), `.replace('/api', '')` / py `.replace` (confidence × 0.9:
+  the first match might not be the trailing one) and py `.removesuffix('/api')`.
+- `{ "origin": true }` — drop the path entirely (`new URL(API_ROOT).origin`).
+- `{ "unknown": true, "method": "slice", ... }` — a transform that could not be modelled (`.slice(0, -4)` adds
+  `"dropChars": 4`; regex replacements that are not an anchored literal suffix; `.removeprefix`, ...). The path
+  stays as before and the consumer confidence is multiplied by 0.8.
+
+Identity transforms for routing (`trim`, case changes, trailing-slash strips such as `.replace(/\/+$/, '')` or
+`.rstrip('/')`) record nothing. When the transformed value already has a literal tail after the base
+(`` `${API}/api`.replace(/\/api$/, '') ``) the tail is edited in place and nothing is recorded.
+
 ### Route normalization (shared by providers and consumers)
 
 - strip scheme/host; strip query string and fragment; collapse `//`; ensure leading `/`; drop trailing `/` (except root);
@@ -293,11 +313,21 @@ when it is statically recognizable; catch-alls keep `catchAll: true` and their `
 2. **Resolve each consumer's target member** in this order:
    1. manifest `bindings` (optional, explicit — wins): `"bindings": { "REACT_APP_API_MOTOR_CALCULO": "gestao:/api/motor" }` means
       "this base points to member `gestao`, with path prefix `/api/motor`". A binding to `"external:<label>"` marks it intentionally external.
+      A key may also be an **origin** — `"https://storage.googleapis.com": "external:gcs"` or a bare host
+      `"storage.googleapis.com": "external:gcs"` / `"api.local:8082": "back"` — to bind bases that have no env name
+      (`base.type: "literal"`). It is matched against the host/port of every candidate value (step 2): scheme-insensitive,
+      ports 80/443 count as "no port", an exact `host:port` key beats a portless key for the same host, and a portless key
+      covers any port. Without a `:/prefix` the value's own path is kept. A key with `://` must be exactly an origin
+      (no path/query/credentials), and two keys for the same origin must agree — both checked by the manifest validation.
    2. `env` values of the consumer's own member (and of the workspace manifest's optional `env` map) → URL → host:port/hostname
       → member whose `services` publish that port/hostname (or whose `services[].name` equals the host).
       `base.suffix` / path segments embedded in the env value are prepended to the consumer path.
    3. otherwise ⇒ `unresolved`.
-3. **Match** the (method, prefix + path) against the target member's providers using the normalized form.
+3. **Join** `prefix or env path` + `base.suffix` + `path`. When the consumer carries `base.transform`, it rewrites the
+   prefix / env path part first: `{ "stripSuffix": "/api" }` removes that trailing path (segment-aligned, case-insensitive;
+   no-op when absent), `{ "origin": true }` drops it entirely, `{ "unknown": true }` keeps it and multiplies the `calls`
+   confidence by `0.8`. The transform is copied to the report row and the edge `evidence`.
+   **Match** the (method, joined path) against the target member's providers using the normalized form.
    Literal routes beat templated ones; templated beat catch-alls; ties keep the first by file order. A method
    mismatch with an exact path is reported, not linked.
 4. **Emit into the workspace graph** (namespaced ids):
@@ -310,7 +340,10 @@ when it is statically recognizable; catch-alls keep `catchAll: true` and their `
    - tables: `writes_to` / `reads_from` between file nodes and a shared `table:workspace/<schema.table>` node, only when
      ≥ 2 members touch the same table.
 5. Write `<workspaceRoot>/.ua/contracts-report.json`: per member pair counts, resolved/unresolved/unmatched consumers with
-   reasons (`no-binding`, `external`, `no-route`, `method-mismatch`), providers with zero consumers (possible dead endpoints),
+   reasons (`no-binding`, `external`, `no-route`, `method-mismatch`) — each unmatched consumer also lists the 3 closest
+   provider routes of its target as `nearest: [{method, route, file}]` (character similarity of the normalized paths,
+   then segment similarity, then file order; empty when the path is unknown or the target has no contracts) —
+   providers with zero consumers (possible dead endpoints),
    and coverage `linked / (consumers with a non-external target)`.
 
 The linker is idempotent: re-running it on the same inputs yields byte-identical output.
@@ -332,12 +365,13 @@ The linker is idempotent: re-running it on the same inputs yields byte-identical
   `nodeIds` sorted. Rebuilt on each run; omitted when the linker creates no node.
 - **Confidence** of a `calls` edge = `consumer.confidence` (default `1.0` when absent or outside
   `(0, 1]`) × match factor (literal `1.0`, templated `0.9`, catch-all `0.5`) × resolution factor
-  (`binding` / manifest `env` `1.0`, member env / base literal `0.9`), rounded to 3 decimals. Several
+  (`binding` / manifest `env` `1.0`, member env / base literal `0.9`) × `0.8` for `base.transform.unknown`,
+  rounded to 3 decimals. Several
   call sites of the same file→endpoint pair share one edge: `callSites` counts them and the edge
   keeps the highest confidence. Fixed weights: `routes` 1.0, `publishes`/`subscribes` 0.9,
   `writes_to`/`reads_from` 0.8.
-- **Precedence.** Target: manifest `bindings` → manifest `env` → member `env` → `base.value`
-  literal; within values, host/service name/hostname beats published port, and a host or port
+- **Precedence.** Target: manifest `bindings` by env name → manifest `env` → member `env` → `base.value`
+  literal, each value checked against origin-keyed `bindings` before the members' `services`; within values, host/service name/hostname beats published port, and a host or port
   served by ≥ 2 members is reported ambiguous (unresolved). Route: literal → templated → catch-all,
   then lower `order`, then first by (file, line). The best route whose method fits wins; if only
   other-method routes match, the consumer is `method-mismatch`.

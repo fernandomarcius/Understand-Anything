@@ -1801,8 +1801,15 @@ function evalTerm(ctx, s, e, env) {
       const open = tok.end + fm[0].length - 1;
       return pyFormat(ctx, literalOf(tok) ?? '', open, env);
     }
+    const lv = () => (tok.template ? templateValue(ctx, tok, env) : val(literalOf(tok)));
+    const calls = trailingMethodCalls(ctx, tok.end, e);
+    if (calls && calls.length && calls.every((c) => TRANSFORM_METHODS.has(c.name) || SLICE_METHODS.has(c.name))) {
+      let v = lv();
+      for (const c of calls) v = applyOp(v, methodOp(ctx, c.name, c.call));
+      return v;
+    }
     if (/^\s*\.\s*(trim|strip|rstrip|lstrip|replace|TrimEnd|TrimStart|Trim|toString|ToString)\b/.test(rest)) {
-      return tok.template ? templateValue(ctx, tok, env) : val(literalOf(tok));
+      return lv();
     }
   }
   if (/^-?\d+(\.\d+)?$/.test(text)) return val(text);
@@ -1899,13 +1906,23 @@ function evalTerm(ctx, s, e, env) {
       return args[0] ? evalExpr(ctx, args[0][0], args[0][1], env) : val('');
     }
     if ((m = /^new\s+URL\s*\(/.exec(text))) {
-      const args = callArgs(ctx, s + m[0].length - 1);
-      if (args.length === 1) return evalExpr(ctx, args[0][0], args[0][1], env);
-      if (args.length >= 2) {
+      const open = s + m[0].length - 1;
+      const close = ctx.close(open);
+      const args = callArgs(ctx, open);
+      let v = null;
+      if (args.length === 1) v = evalExpr(ctx, args[0][0], args[0][1], env);
+      else if (args.length >= 2) {
         const rel = evalExpr(ctx, args[0][0], args[0][1], env);
         const base = evalExpr(ctx, args[1][0], args[1][1], env);
-        if (rel.base) return rel;
-        return concat(base, val('/' + rel.text.replace(/^\/+/, '')));
+        v = rel.base ? rel : concat(base, val('/' + rel.text.replace(/^\/+/, '')));
+      }
+      if (v) {
+        // trailing property: `.origin` drops the path; `.href` / `.toString()` keep it
+        const rest = close !== undefined ? code.slice(close + 1, e) : '';
+        if (/^\s*\.\s*origin\s*$/.test(rest)) return applyOp(v, { origin: true });
+        if (/^\s*\.\s*(href|toString\s*\(\s*\))?\s*$/.test(rest) || !/\S/.test(rest)) return v;
+        const pm = /^\s*\.\s*([A-Za-z_$][\w$]*)/.exec(rest);
+        return applyOp(v, unknownOp(pm ? pm[1] : 'URL'));
       }
     }
     if (/^new\s+URLSearchParams\b/.test(text)) return dyn();
@@ -2030,16 +2047,166 @@ function parseChain(ctx, s, e) {
   return { segs, isNew };
 }
 
-const TRANSFORM_METHODS = new Set(['removesuffix', 'removeprefix', 'trim', 'trimEnd', 'trimStart', 'replace', 'replaceAll', 'toString', 'valueOf', 'toLowerCase', 'toUpperCase', 'strip', 'rstrip', 'lstrip', 'TrimEnd', 'TrimStart', 'Trim', 'ToString', 'ToLowerInvariant', 'ToLower', 'rstrip', 'normalize']);
+const TRANSFORM_METHODS = new Set(['removesuffix', 'removeprefix', 'trim', 'trimEnd', 'trimStart', 'replace', 'replaceAll', 'toString', 'valueOf', 'toLowerCase', 'toUpperCase', 'strip', 'rstrip', 'lstrip', 'TrimEnd', 'TrimStart', 'Trim', 'ToString', 'ToLowerInvariant', 'ToLower', 'normalize']);
+// Only a transform when the receiver is a URL value (arrays slice too).
+const SLICE_METHODS = new Set(['slice', 'substring']);
+
+// ---------------------------------------------------------------------------
+// String transforms on a URL value (base derivation: `API_ROOT.replace(/\/api$/, '')`)
+// ---------------------------------------------------------------------------
+//
+// An op is one of: NOOP (identity for routing: trim, trailing-slash strip, case),
+// { stripSuffix, anywhere?, factor? } (drop a trailing path), { origin: true } (drop the
+// path entirely), { sliceEnd: n } (drop the last n chars) or { unknown: true, method }.
+// On a value with a base and no literal tail the op is recorded on `base.transform`
+// (the linker applies it to the base's resolved path); a known literal tail is edited
+// in place instead.
+
+const NOOP = Object.freeze({ noop: true });
+const UNKNOWN_TRANSFORM_FACTOR = 0.8;
+const unknownOp = (method) => ({ unknown: true, method });
+
+/** `/\/api$/` → { suffix: '/api' }; `/\/+$/` → { noop }; anything else → null. */
+function regexSuffix(raw) {
+  const m = /^\/((?:\\.|[^\\/\n])+)\/([a-z]*)$/.exec(raw || '');
+  if (!m) return null;
+  const body = m[1];
+  if (/^\\\/[+*]?\$$/.test(body)) return { noop: true };
+  const mm = /^((?:\\[/.\-_~]|[A-Za-z0-9_\-~%])+?)(?:\\\/[?*])?\$$/.exec(body);
+  if (!mm || !mm[1].startsWith('\\/')) return null;
+  return { suffix: mm[1].replace(/\\(.)/g, '$1') };
+}
+
+/** Describe `.name(args)` applied to a URL value as an op (see above). */
+function methodOp(ctx, name, call) {
+  const args = call ? callArgs(ctx, call[0]) : [];
+  const lit = (i) => (args[i] ? stringAt(ctx, args[i][0], args[i][1]) : null);
+  const raw = (i) => (args[i] ? ctx.src.slice(args[i][0], args[i][1]).trim() : null);
+  switch (name) {
+    case 'trim': case 'trimEnd': case 'trimStart': case 'strip': case 'Trim':
+    case 'toString': case 'valueOf': case 'ToString': case 'normalize':
+    case 'toLowerCase': case 'toUpperCase': case 'ToLower': case 'ToLowerInvariant':
+      return NOOP;
+    case 'rstrip': case 'lstrip': case 'TrimEnd': case 'TrimStart': {
+      if (!args.length) return NOOP;
+      const l = lit(0);
+      return l !== null && /^[/\s]*$/.test(l) ? NOOP : unknownOp(name);
+    }
+    case 'removesuffix': {
+      const l = lit(0);
+      if (l === '/') return NOOP;
+      return l && /^\/[\w\-.~%/]*[^/]$/.test(l) ? { stripSuffix: l } : unknownOp(name);
+    }
+    case 'replace': case 'replaceAll': {
+      if (args.length !== 2 || lit(1) !== '') return unknownOp(name);
+      if (ctx.lang === 'js') {
+        const r = regexSuffix(raw(0));
+        if (r) return r.noop ? NOOP : { stripSuffix: r.suffix };
+      }
+      const p = lit(0);
+      // string pattern: first (JS) / every (py, replaceAll) occurrence, usually the trailing one
+      if (p && /^\/[\w\-.~%/]*[^/]$/.test(p)) return { stripSuffix: p, anywhere: name === 'replaceAll' || ctx.lang !== 'js' ? 'all' : 'first', factor: 0.9 };
+      return unknownOp(name);
+    }
+    case 'slice': case 'substring': {
+      if (args.length === 1 && raw(0) === '0') return NOOP;
+      if (name === 'slice' && args.length === 2 && raw(0) === '0' && /^-\d+$/.test(raw(1))) return { sliceEnd: Number(raw(1).slice(1)) };
+      return unknownOp(name);
+    }
+    default:
+      return unknownOp(name);
+  }
+}
+
+/** Record `t` on the base (composing with an earlier transform). */
+function withBaseTransform(base, t) {
+  const prev = base.transform;
+  let next = t;
+  if (prev) {
+    if (t.origin) next = { origin: true };
+    else if (prev.origin && t.stripSuffix !== undefined) next = prev; // root has no suffix
+    else next = { unknown: true, method: t.method || prev.method || null };
+  }
+  return { ...base, transform: next };
+}
+
+function applyOp(v, op) {
+  if (!op || op.noop) return v;
+  const tail = v.suffix + v.text;
+  const pure = !tail.includes(DYN) && !tail.includes(MARK);
+  if (!v.base) {
+    // literal URL: apply exactly when the text is fully known; otherwise keep it as is
+    if (!pure) return v;
+    if (op.origin) {
+      const m = /^([a-z][a-z0-9+.-]*:\/\/[^/?#]+)/i.exec(v.text);
+      return m ? { ...v, text: m[1] } : v;
+    }
+    if (op.stripSuffix !== undefined) {
+      const s = op.stripSuffix;
+      if (op.anywhere === 'first') return { ...v, text: v.text.replace(s, '') };
+      if (op.anywhere === 'all') return { ...v, text: v.text.split(s).join('') };
+      return v.text.endsWith(s) ? { ...v, text: v.text.slice(0, -s.length) } : v;
+    }
+    if (op.sliceEnd) return { ...v, text: v.text.slice(0, -op.sliceEnd) };
+    return v;
+  }
+  if (op.origin) return { ...v, suffix: '', text: '', base: withBaseTransform(v.base, { origin: true }) };
+  const unknown = (method) => ({ ...v, base: withBaseTransform(v.base, unknownOp(method)), conf: v.conf * UNKNOWN_TRANSFORM_FACTOR });
+  if (tail === '') {
+    if (op.stripSuffix !== undefined) return { ...v, base: withBaseTransform(v.base, { stripSuffix: op.stripSuffix }), conf: v.conf * (op.factor ?? 1) };
+    if (op.sliceEnd) return { ...v, base: withBaseTransform(v.base, { ...unknownOp('slice'), dropChars: op.sliceEnd }), conf: v.conf * UNKNOWN_TRANSFORM_FACTOR };
+    return unknown(op.method);
+  }
+  if (!pure) return unknown(op.method || 'transform');
+  if (op.stripSuffix !== undefined && !op.anywhere) {
+    const s = op.stripSuffix;
+    if (v.text.endsWith(s)) return { ...v, text: v.text.slice(0, -s.length) };
+    if (v.text === '' && v.suffix.endsWith(s)) return { ...v, suffix: v.suffix.slice(0, -s.length) };
+    return v; // anchored pattern not at the end: no match at runtime
+  }
+  // string pattern with a literal tail: the (first) match may be inside the base
+  if (op.stripSuffix !== undefined) return unknown('replace');
+  if (op.sliceEnd) {
+    if (v.text.length >= op.sliceEnd) return { ...v, text: v.text.slice(0, -op.sliceEnd) };
+    if (v.text === '' && v.suffix.length >= op.sliceEnd) return { ...v, suffix: v.suffix.slice(0, -op.sliceEnd) };
+    return unknown('slice');
+  }
+  return unknown(op.method);
+}
+
+/**
+ * `.a(...).b(...)` method calls in [s,e) (after a string literal) → [{ name, call }],
+ * or null when the range is not exactly such a chain.
+ */
+function trailingMethodCalls(ctx, s, e) {
+  const out = [];
+  let i = s;
+  for (;;) {
+    i = skipWs(ctx.code, i, e);
+    if (i >= e) return out;
+    const m = /^\.\s*([A-Za-z_$][\w$]*)\s*\(/.exec(ctx.code.slice(i, e));
+    if (!m) return null;
+    const open = i + m[0].length - 1;
+    const close = ctx.close(open);
+    if (close === undefined || close >= e) return null;
+    out.push({ name: m[1], call: [open, close] });
+    i = close + 1;
+  }
+}
 
 function evalChain(ctx, chain, env) {
   const { segs } = chain;
   const last = segs[segs.length - 1];
-  // method transforms on a value: x.trim(), x.replace(...)
-  if (segs.length > 1 && last.call && TRANSFORM_METHODS.has(last.name)) {
+  // method transforms on a value: x.trim(), x.replace(...), x.slice(0, -4)
+  if (segs.length > 1 && last.call && (TRANSFORM_METHODS.has(last.name) || SLICE_METHODS.has(last.name))) {
     const head = { segs: segs.slice(0, -1), isNew: chain.isNew };
     const inner = evalChainOrExpr(ctx, head, env);
-    return inner;
+    if (!SLICE_METHODS.has(last.name) || inner.base) return applyOp(inner, methodOp(ctx, last.name, last.call));
+  }
+  // (new URL(x)).origin
+  if (segs.length > 1 && !last.call && last.name === 'origin') {
+    const inner = evalChainOrExpr(ctx, { segs: segs.slice(0, -1), isNew: chain.isNew }, env);
+    if (inner.base || /^[a-z][a-z0-9+.-]*:\/\//i.test(inner.text)) return applyOp(inner, { origin: true });
   }
   if (segs.length > 1 && last.call && last.name === 'concat') {
     const head = evalChainOrExpr(ctx, { segs: segs.slice(0, -1) }, env);
@@ -2891,7 +3058,7 @@ function finalizeConsumer(ctx, call, r) {
     if (base && text.startsWith(DYN) && !suffix) path = path === '/{}' ? null : path;
   }
   const outBase = base
-    ? { type: base.type, name: base.name ?? null, value: base.value ?? null, suffix: normalizeSuffix(suffix), ...(base.fallbacks ? { fallbacks: base.fallbacks } : {}) }
+    ? { type: base.type, name: base.name ?? null, value: base.value ?? null, suffix: normalizeSuffix(suffix), ...(base.fallbacks ? { fallbacks: base.fallbacks } : {}), ...(base.transform ? { transform: base.transform } : {}) }
     : { type: 'unknown', name: null, value: null, suffix: normalizeSuffix(suffix) };
   const method = r.method && r.method.method ? r.method.method : r.method && r.method.method === null ? 'GET' : 'GET';
   let confidence = conf0;

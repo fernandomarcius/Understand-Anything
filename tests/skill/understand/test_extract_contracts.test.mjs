@@ -550,3 +550,65 @@ describe('JS/TS member', () => {
     expect(data.stats.unresolvedConsumers).toBe(unresolved);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Base transforms: a base derived from an env base by a string transform
+// ---------------------------------------------------------------------------
+
+describe('base transforms', () => {
+  let data;
+  beforeAll(() => {
+    ({ data } = extract('base-transform'));
+  });
+  const variante = (name) => consumer(data, 'src/api/variantes.js', 'GET', `/Variante/${name}`);
+
+  it('records stripSuffix for a helper that does .replace(/\\/api$/, "") (wrapper consumers)', () => {
+    const post = consumer(data, 'src/api/Relatorio.js', 'POST', '/Relatorio/IniciarGravacao');
+    expect(post).toBeDefined();
+    expect(post.base).toMatchObject({ type: 'env', name: 'REACT_APP_API_GESTAO', suffix: '', transform: { stripSuffix: '/api' } });
+    const get = consumer(data, 'src/api/Relatorio.js', 'GET', '/Relatorio/Percentual');
+    expect(get.base.transform).toEqual({ stripSuffix: '/api' });
+  });
+
+  it('keeps the transform through a module constant with an embedded path (axios({ url }))', () => {
+    const c = consumer(data, 'src/assets/functions/DownloadResumo.js', 'GET', '/Relatorio/DownloadResumo');
+    expect(c).toBeDefined();
+    expect(c.base).toMatchObject({ type: 'env', name: 'REACT_APP_API_GESTAO', transform: { stripSuffix: '/api' } });
+  });
+
+  it('records no transform when the base is used as-is', () => {
+    const c = variante('sem-barra');
+    expect(c).toBeDefined();
+    expect(c.base).toMatchObject({ type: 'env', name: 'REACT_APP_API_GESTAO' });
+    expect(c.base.transform).toBeUndefined();
+    const motor = consumer(data, 'src/api/variantes.js', 'GET', '/calcular');
+    expect(motor.base).toMatchObject({ suffix: '/motor' });
+    expect(motor.base.transform).toBeUndefined();
+  });
+
+  it('applies a transform to a literal tail instead of the base', () => {
+    const c = variante('cauda');
+    expect(c).toBeDefined();
+    expect(c.base).toMatchObject({ type: 'env', name: 'REACT_APP_API_GESTAO', suffix: '' });
+    expect(c.base.transform).toBeUndefined();
+  });
+
+  it('recognizes .replace("/api", ""), template .replace(regex) and new URL(x).origin', () => {
+    expect(variante('string').base.transform).toEqual({ stripSuffix: '/api' });
+    expect(variante('template').base.transform).toEqual({ stripSuffix: '/api' });
+    const origin = variante('origin');
+    expect(origin).toBeDefined();
+    expect(origin.base).toMatchObject({ type: 'env', name: 'REACT_APP_API_GESTAO', transform: { origin: true } });
+  });
+
+  it('marks unrecognized transforms as unknown with lower confidence', () => {
+    const plain = variante('sem-barra');
+    for (const name of ['slice', 'odd']) {
+      const c = variante(name);
+      expect(c, name).toBeDefined();
+      expect(c.base).toMatchObject({ type: 'env', name: 'REACT_APP_API_GESTAO' });
+      expect(c.base.transform.unknown).toBe(true);
+      expect(c.confidence).toBeLessThan(plain.confidence);
+    }
+  });
+});
