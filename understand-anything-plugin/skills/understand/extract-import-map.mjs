@@ -283,7 +283,11 @@ function parseTsConfigText(raw) {
     }
   }
   const compilerOptions = parsed?.compilerOptions ?? {};
-  const baseUrl = compilerOptions.baseUrl ?? '.';
+  // hasBaseUrl tracks whether baseUrl was set EXPLICITLY. Only then do bare
+  // specifiers resolve against it (TypeScript semantics); the '.' default
+  // exists solely to anchor `paths` targets.
+  const hasBaseUrl = typeof compilerOptions.baseUrl === 'string';
+  const baseUrl = hasBaseUrl ? compilerOptions.baseUrl : '.';
   const paths = new Map();
   if (compilerOptions.paths && typeof compilerOptions.paths === 'object') {
     for (const [alias, targets] of Object.entries(compilerOptions.paths)) {
@@ -292,14 +296,15 @@ function parseTsConfigText(raw) {
       }
     }
   }
-  return { baseUrl, paths };
+  return { baseUrl, hasBaseUrl, paths };
 }
 
 /**
- * Load every `tsconfig.json` discovered in the input file list and parse
- * each. Returns `Map<dirPath, { baseUrl, paths }>` keyed by the
- * project-relative POSIX directory containing the tsconfig (empty string
- * for a root-level tsconfig.json).
+ * Load every `tsconfig.json` / `jsconfig.json` discovered in the input file
+ * list and parse each. Returns `Map<dirPath, { baseUrl, hasBaseUrl, paths }>`
+ * keyed by the project-relative POSIX directory containing the config (empty
+ * string for a root-level config). jsconfig.json shares the tsconfig schema
+ * (CRA / plain-JS projects); when both sit in one directory, tsconfig wins.
  *
  * `paths` keys keep their trailing `*` wildcards intact (e.g. `"@/*"`); the
  * resolver matches them by prefix. Values are arrays because tsconfig
@@ -322,8 +327,14 @@ function parseTsConfigText(raw) {
  *      where the stripper damaged a string literal containing `//`.
  *   3. If both fail, warn and skip — that tsconfig contributes no aliases.
  */
+const TS_CONFIG_NAMES = new Set(['tsconfig.json', 'jsconfig.json']);
+
 async function loadTsConfigs(projectRoot, files) {
   const out = new Map();
+  // Which config name populated each dir in `out` — tsconfig.json wins over
+  // a sibling jsconfig.json regardless of input order (TypeScript ignores
+  // jsconfig when tsconfig is present).
+  const sourceByDir = new Map();
   const warnings = [];
   const failures = [];
   // Collect the candidate paths in the original file order before reading,
@@ -332,18 +343,19 @@ async function loadTsConfigs(projectRoot, files) {
   for (const f of files) {
     const p = toPosix(f.path);
     const base = p.includes('/') ? p.slice(p.lastIndexOf('/') + 1) : p;
-    if (base !== 'tsconfig.json') continue;
+    if (!TS_CONFIG_NAMES.has(base)) continue;
     const absPath = join(projectRoot, p);
     if (!existsSync(absPath)) continue;
     candidates.push({ key: p, absPath });
   }
   const reads = await readFilesParallel(candidates);
   for (const { key: p, raw, err } of reads) {
+    const configName = p.includes('/') ? p.slice(p.lastIndexOf('/') + 1) : p;
     if (err) {
       failures.push({ path: p, stage: 'resolver-config-read', message: err.message });
       // absPath isn't carried through the helper return shape; reconstruct it.
       warnings.push(
-        `Warning: extract-import-map: tsconfig.json at ${join(projectRoot, p)} failed ` +
+        `Warning: extract-import-map: ${configName} at ${join(projectRoot, p)} failed ` +
         `to read (${err.message}) — path aliases from this config will ` +
         `not be applied — relative imports unaffected\n`,
       );
@@ -354,16 +366,19 @@ async function loadTsConfigs(projectRoot, files) {
       failures.push({
         path: p,
         stage: 'resolver-config-parse',
-        message: 'invalid tsconfig.json',
+        message: `invalid ${configName}`,
       });
       warnings.push(
-        `Warning: extract-import-map: tsconfig.json at ${join(projectRoot, p)} failed ` +
+        `Warning: extract-import-map: ${configName} at ${join(projectRoot, p)} failed ` +
         `to parse — path aliases from this config will not be applied ` +
         `— relative imports unaffected\n`,
       );
       continue;
     }
-    out.set(dirOf(p), parsed);
+    const dir = dirOf(p);
+    if (sourceByDir.get(dir) === 'tsconfig.json') continue;
+    out.set(dir, parsed);
+    sourceByDir.set(dir, configName);
   }
   return { configs: out, warnings, failures };
 }
@@ -771,19 +786,21 @@ export function resolveTsJsImport(rawImport, file, ctx) {
   const tsConfigDir = findNearestConfigDir(importerDir, ctx.tsConfigs);
   if (tsConfigDir !== undefined) {
     const tsConfig = ctx.tsConfigs.get(tsConfigDir);
-    const { baseUrl, paths } = tsConfig;
+    const { baseUrl, hasBaseUrl, paths } = tsConfig;
+    // baseUrl is tsconfig-dir-relative; '.', './', '' all mean the
+    // tsconfig's own directory. We anchor at tsConfigDir so a nested
+    // tsconfig's `baseUrl: '.'` maps to its package, not project root.
+    const normalizedBase = baseUrl === '.' || baseUrl === ''
+      ? ''
+      : toPosix(baseUrl);
+    let aliasMatched = false;
     if (paths && paths.size > 0) {
       for (const [alias, targets] of paths) {
         const aliasMatch = matchTsAlias(alias, src);
         if (aliasMatch === null) continue;
+        aliasMatched = true;
         for (const target of targets) {
           const mapped = applyTsAlias(target, aliasMatch);
-          // baseUrl is tsconfig-dir-relative; '.', './', '' all mean the
-          // tsconfig's own directory. We anchor at tsConfigDir so a nested
-          // tsconfig's `baseUrl: '.'` maps to its package, not project root.
-          const normalizedBase = baseUrl === '.' || baseUrl === ''
-            ? ''
-            : toPosix(baseUrl);
           const relativeToConfig = normalizedBase
             ? posix.join(normalizedBase, mapped)
             : mapped;
@@ -802,6 +819,23 @@ export function resolveTsJsImport(rawImport, file, ctx) {
           const probed = probeWithExtensions(candidate, ctx.fileSet);
           if (probed) return probed;
         }
+      }
+    }
+
+    // baseUrl fallback: with an EXPLICIT baseUrl, TypeScript (and CRA /
+    // webpack through jsconfig/tsconfig) resolve a bare specifier relative
+    // to it when no `paths` pattern matched — `baseUrl: "./src"` makes
+    // `import x from 'api/client'` mean src/api/client.js. A matched alias
+    // that failed to resolve does not fall through (TypeScript semantics).
+    // The candidate only counts when it exists in the project file set, so
+    // real packages (`react`, `lodash/fp`) stay external.
+    if (hasBaseUrl && !aliasMatched && !src.startsWith('/')) {
+      const candidate = posix.normalize(
+        posix.join(tsConfigDir || '.', normalizedBase || '.', src),
+      );
+      if (candidate !== '..' && !candidate.startsWith('../')) {
+        const probed = probeWithExtensions(candidate, ctx.fileSet);
+        if (probed) return probed;
       }
     }
   }

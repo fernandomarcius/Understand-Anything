@@ -528,6 +528,179 @@ describe('extract-import-map.mjs — TypeScript / JavaScript resolver', () => {
     expect(result.output.importMap['src/app.ts']).toContain('lib/thing.ts');
   });
 
+  // ── baseUrl-relative bare specifiers + jsconfig.json ────────────────────
+  // TypeScript (and CRA/webpack via jsconfig/tsconfig) resolve a bare
+  // specifier against an explicit `baseUrl` when no `paths` alias matches:
+  // `baseUrl: "./src"` + `import x from 'api/client'` → src/api/client.js.
+  // A specifier only becomes an edge when the probed file exists in the
+  // project, so real packages (`react`) stay external.
+
+  it('resolves bare specifiers relative to an explicit tsconfig baseUrl', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: './src' } }),
+      'src/pages/Home.jsx': `import React from 'react';\nimport { get } from 'api/client';\nimport Card from 'components/Card';\n`,
+      'src/api/client.js': `export const get = () => 1;\n`,
+      'src/components/Card/index.jsx': `export default function Card() { return null; }\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/pages/Home.jsx', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/api/client.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/components/Card/index.jsx', language: 'javascript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/pages/Home.jsx']).toEqual([
+      'src/api/client.js',
+      'src/components/Card/index.jsx',
+    ]);
+  });
+
+  it('loads jsconfig.json like tsconfig.json for baseUrl resolution', () => {
+    projectRoot = setupTree({
+      'jsconfig.json': `{\n  // CRA jsconfig\n  "compilerOptions": { "baseUrl": "src" }\n}\n`,
+      'src/App.js': `import { get } from 'api/client';\n`,
+      'src/api/client.js': `export const get = () => 1;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'jsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/App.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/api/client.js', language: 'javascript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/App.js']).toEqual(['src/api/client.js']);
+  });
+
+  it('prefers tsconfig.json over jsconfig.json in the same directory', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: 'src' } }),
+      'jsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: 'lib' } }),
+      'src/App.js': `import { a } from 'util/a';\n`,
+      'src/util/a.js': `export const a = 1;\n`,
+      'lib/util/a.js': `export const a = 2;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'jsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/App.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/util/a.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'lib/util/a.js', language: 'javascript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/App.js']).toEqual(['src/util/a.js']);
+  });
+
+  it('lets a matching paths alias win over the baseUrl fallback', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: {
+          baseUrl: 'src',
+          paths: { 'utils/*': ['lib/utils/*'] },
+        },
+      }),
+      'src/app.ts': `import { f } from 'utils/format';\nimport { g } from 'services/api';\n`,
+      'src/utils/format.ts': `export const f = 1;\n`,
+      'src/lib/utils/format.ts': `export const f = 2;\n`,
+      'src/services/api.ts': `export const g = 3;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/app.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'src/utils/format.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'src/lib/utils/format.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'src/services/api.ts', language: 'typescript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/app.ts']).toEqual([
+      'src/lib/utils/format.ts',
+      'src/services/api.ts',
+    ]);
+  });
+
+  it('keeps a bare package external when baseUrl only has a same-named folder', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: './src' } }),
+      'src/App.js': `import React from 'react';\nimport moment from 'moment';\n`,
+      // A folder named like the package, but no react.js / react/index.js.
+      'src/react/hooks.js': `export const useX = () => 1;\n`,
+      'src/moment/README.md': `# not code\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/App.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/react/hooks.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/moment/README.md', language: 'markdown', fileCategory: 'docs' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/App.js']).toEqual([]);
+  });
+
+  it('never resolves a baseUrl target that escapes the project root', () => {
+    projectRoot = setupTree({
+      'app/tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '../..' } }),
+      'app/main.ts': `import { x } from 'app/thing';\n`,
+      'app/thing.ts': `export const x = 1;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'app/tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'app/main.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'app/thing.ts', language: 'typescript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['app/main.ts']).toEqual([]);
+  });
+
+  it('keeps bare specifiers external when no config sets baseUrl explicitly', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { paths: { '@/*': ['src/*'] } } }),
+      'src/app.ts': `import { b } from 'src/bar';\nimport { c } from 'bar';\n`,
+      'src/bar.ts': `export const b = 1;\n`,
+      'bar.ts': `export const c = 1;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/app.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'src/bar.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'bar.ts', language: 'typescript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/app.ts']).toEqual([]);
+  });
+
   // ── #294: NodeNext / ESM TypeScript `.js → .ts` rewrite ────────────────
   //
   // Under `moduleResolution: NodeNext`, TypeScript does NOT rewrite import
