@@ -519,6 +519,8 @@ def link(graph: dict[str, Any], members: list[str], contracts: dict[str, dict[st
     graph["edges"].extend(em.edges.values())
     if em.nodes:
         graph["layers"].append({**CONTRACTS_LAYER, "nodeIds": sorted(em.nodes)})
+    # Tour steps (e.g. the workspace tour) may cite contract nodes: drop only the ids this run did not re-create.
+    _prune_tour(graph, removed_ids - em.nodes.keys())
     return {
         "version": 1,
         "members": [_member_summary(m, contracts.get(m)) for m in members],
@@ -535,7 +537,7 @@ def link(graph: dict[str, Any], members: list[str], contracts: dict[str, dict[st
 
 
 def _strip_contracts_layer(graph: dict[str, Any], removed_ids: set[Any]) -> None:
-    """Drop the contracts layer and any reference to previously generated nodes."""
+    """Drop the contracts layer and layer references to previously generated nodes."""
     layers = graph.get("layers") if isinstance(graph.get("layers"), list) else []
     kept: list[Any] = []
     for layer in layers:
@@ -545,10 +547,13 @@ def _strip_contracts_layer(graph: dict[str, Any], removed_ids: set[Any]) -> None
             layer["nodeIds"] = [i for i in layer["nodeIds"] if i not in removed_ids]
         kept.append(layer)
     graph["layers"] = kept
-    if removed_ids and isinstance(graph.get("tour"), list):
+
+
+def _prune_tour(graph: dict[str, Any], gone: set[Any]) -> None:
+    if gone and isinstance(graph.get("tour"), list):
         for step in graph["tour"]:
             if isinstance(step, dict) and isinstance(step.get("nodeIds"), list):
-                step["nodeIds"] = [i for i in step["nodeIds"] if i not in removed_ids]
+                step["nodeIds"] = [i for i in step["nodeIds"] if i not in gone]
 
 
 def _member_summary(member: str, c: dict[str, Any] | None) -> dict[str, Any]:

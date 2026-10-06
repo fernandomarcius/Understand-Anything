@@ -56,7 +56,7 @@ a `:` become `M/<id>`.
 - `tour`: member tours are concatenated in manifest order. Each member contributes a leading
   step `{ title: "<M>", description: <member project.description>, nodeIds: [] }` followed by
   its own steps (with `nodeIds` rewritten). `order` is renumbered `1..N` across the result.
-  A workspace-level tour (across services) is a later stage.
+  A workspace-level tour (across services), when present, goes before them — see "Workspace tour".
 - Nothing else in nodes/edges is modified (summaries, tags, weights, complexity, extra keys).
 
 ### Project metadata
@@ -177,7 +177,47 @@ Both `packages/dashboard/vite.config.ts` and `packages/viewer/bin/viewer.mjs` im
    `meta.json.gitCommitHash` equals their current `HEAD` and that have a graph are skipped
    without any LLM call.
 3. Run `merge-workspace-graphs.py <root>` (merge + contract linking + validation; `--no-contracts` skips linking).
-4. Launch the dashboard on the workspace root.
+4. Workspace tour (see below): when `crossServiceLinks > 0`, dispatch `tour-builder` on
+   `workspace-tour-input.json` and re-run the merge; otherwise skip.
+5. Launch the dashboard on the workspace root.
+
+## Workspace tour
+
+The member tours explain each service; the workspace tour explains the **system** — one request
+followed across services (e.g. UI → API → queue → worker → data). Two deterministic ends around
+one LLM step:
+
+1. **Input** (every successful merge, after linking): `<root>/.ua/intermediate/workspace-tour-input.json`
+
+   ```jsonc
+   {
+     "version": 1, "workspace": "cloudbi", "outputLanguage": "pt-BR",   // workspace config, else first member's
+     "crossServiceLinks": 14,             // sum of the link counts below; 0 ⇒ the skill skips the tour
+     "members": [{ "name", "description", "languages", "frameworks", "files",          // file-level nodes
+                   "topLayers": [{ "id", "name", "nodes" }],                           // ≤ 5, largest first
+                   "tourStart": ["file:front/src/index.js"] }],                       // member tour step 1
+     "services": { "links": [{ "source", "target", "calls", "messages", "tables" }] }, // = dashboard Services view
+     "contracts": {                       // ≤ 10 each, most members first; sides are [{ member, nodeId }]
+       "endpoints": [{ "id", "name", "member", "providers", "consumers", "consumerMembers" }],
+       "channels":  [{ "id", "name", "publishers", "subscribers" }],
+       "tables":    [{ "id", "name", "writers", "readers" }]
+     },
+     "nodes": { "<id>": { "type", "name", "member", "summary" } }   // every id cited above, and only those
+   }
+   ```
+
+   `services.links` reimplements core `buildServiceGraph` (cross-member `calls`; publisher → subscriber
+   per shared channel; shared table writer → reader, else manifest order). Endpoints count only
+   `calls` from another member. Output is byte-identical for the same inputs.
+2. **Narrative** (LLM, skill only): `tour-builder` reads the input and writes
+   `<root>/.ua/workspace-tour.json` — an array of 5–10 `{ title, description, nodeIds, languageLesson? }`
+   citing only ids from `nodes`; a step that crosses a contract cites nodes from ≥ 2 services.
+3. **Placement** (every merge): when `workspace-tour.json` exists, its steps (sorted by `order` if given;
+   a `{ "steps": [...] }` envelope is accepted; steps without `title` are skipped) go **first** in
+   `tour`, before the per-member tours. Node ids absent from the graph are dropped with one warning
+   each, and `order` is renumbered `1..N`. An unparsable file is ignored with a warning; without the
+   file the tour is unchanged. Re-running `link-contracts.py` keeps tour references to contract
+   nodes it re-creates.
 
 ---
 

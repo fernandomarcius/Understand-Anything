@@ -47,7 +47,16 @@ Use this when `$ARGUMENTS` contains `--workspace`. It analyzes several repositor
    ```
    It writes `$WORKSPACE_ROOT/.ua/knowledge-graph.json` and `meta.json` (plus `config.json` with the first member's `outputLanguage` when the workspace has none) and prints one line per member and a total. On a non-zero exit, show the error and **STOP** (nothing is written).
 
-6. **Report and launch.** Summarize: members analyzed vs skipped, per-member node/edge counts from the merge output, total, and the output path. Then launch the dashboard on the workspace root by invoking the `/understand-dashboard` skill with `$WORKSPACE_ROOT` as its argument. The dashboard opens files from every member and shows per-member freshness (stale members are listed by name).
+6. **Workspace tour (system-level narrative).** The merge also writes `$WORKSPACE_ROOT/.ua/intermediate/workspace-tour-input.json`: members (description, languages, file count, top layers, `tourStart` = their tour step 1 node ids), `services.links` (member → member counts of `calls` / `messages` / `tables`), the top cross-service `contracts` (endpoints by consumers, channels, shared tables, each with namespaced node ids), a `nodes` index of every id it cites, `crossServiceLinks` and `outputLanguage`.
+   - **Skip** this step when `crossServiceLinks` is `0` (no linked contracts, or `--no-contracts`): there is no request to follow across services. Report `Workspace tour: skipped (no cross-service links)` and keep any existing `.ua/workspace-tour.json` as is.
+   - Otherwise report `[Workspace] Building the system tour...` and dispatch a subagent using the `tour-builder` agent definition (at `agents/tour-builder.md`), with the language directive for the input's `outputLanguage` and these parameters:
+     > Create a **workspace tour** (see "Workspace tour" in your instructions).
+     > Input: `$WORKSPACE_ROOT/.ua/intermediate/workspace-tour-input.json`
+     > Write output to: `$WORKSPACE_ROOT/.ua/workspace-tour.json`
+     > 5–10 steps that follow a request end-to-end across services (e.g. UI → API → queue → worker → data), using ONLY node ids that are keys of the input's `nodes` object.
+   - Then re-run the merge (zero LLM calls) so the tour lands in the graph: `python3 "<SKILL_DIR>/merge-workspace-graphs.py" "$WORKSPACE_ROOT"` (append `--no-contracts` only if step 5 used it). Its steps go first in `tour`, before the per-member tours; ids missing from the graph are dropped with a warning and `order` is renumbered. If the subagent fails, report it and keep the graph from step 5.
+
+7. **Report and launch.** Summarize: members analyzed vs skipped, per-member node/edge counts from the merge output, total, and the output path. Then launch the dashboard on the workspace root by invoking the `/understand-dashboard` skill with `$WORKSPACE_ROOT` as its argument. The dashboard opens files from every member and shows per-member freshness (stale members are listed by name).
 
 ---
 

@@ -318,6 +318,84 @@ class _Workspace(unittest.TestCase):
         return (self.root / ".ua" / name).read_bytes()
 
 
+# ── Workspace tour input (merge-workspace-graphs.py, after linking) ──────
+
+class TestWorkspaceTourInput(_Workspace):
+    def _input(self) -> dict[str, Any]:
+        return self._read("intermediate/workspace-tour-input.json")
+
+    def test_services_and_top_contracts(self) -> None:
+        self._standard()
+        res = self._merge()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        inp = self._input()
+        links = {(l["source"], l["target"]): l for l in inp["services"]["links"]}
+        self.assertEqual(links[("front", "gestao")], {"source": "front", "target": "gestao",
+                                                      "calls": 6, "messages": 0, "tables": 0})
+        self.assertEqual(links[("excel", "gestao")]["calls"], 1)
+        self.assertEqual(links[("gestao", "brain")]["messages"], 2)  # glob subscription, two channels
+        self.assertEqual(links[("gestao", "motor")]["tables"], 2)    # LOG_RESUMO + OperacaoObra
+        self.assertNotIn(("gestao", "gestao"), links)                # self-call is not cross-service
+        self.assertEqual(inp["crossServiceLinks"],
+                         sum(l["calls"] + l["messages"] + l["tables"] for l in links.values()))
+
+        top = inp["contracts"]["endpoints"][0]
+        self.assertEqual(top["id"], PREEXISTING_ENDPOINT.replace("endpoint:", "endpoint:gestao/"))
+        self.assertEqual(top["consumerMembers"], 2)
+        self.assertEqual(top["consumers"], [
+            {"member": "front", "nodeId": f"file:front/{FRONT_OPS}"},
+            {"member": "excel", "nodeId": f"file:excel/{EXCEL_HTTP}"}])
+        self.assertEqual(top["providers"], [{"member": "gestao", "nodeId": f"file:gestao/{GESTAO_OPS}"}])
+        self.assertTrue(all(r["member"] != "front" for r in inp["contracts"]["endpoints"]))
+
+        channels = {c["id"]: c for c in inp["contracts"]["channels"]}
+        det = channels["concept:codeq/brain-relatorio-detalhado"]
+        self.assertEqual(det["publishers"], [{"member": "gestao", "nodeId": f"file:gestao/{GESTAO_BRAIN}"}])
+        self.assertEqual(det["subscribers"], [{"member": "brain", "nodeId": f"file:brain/{BRAIN_PEDIDO}"}])
+        tables = [t["id"] for t in inp["contracts"]["tables"]]
+        self.assertEqual(tables[0], "table:workspace/dbo.LOG_RESUMO")  # touched by 3 members
+
+        # Every id the input cites is in its `nodes` index and in the graph.
+        graph_ids = {n["id"] for n in self._read("knowledge-graph.json")["nodes"]}
+        cited = {r["id"] for group in inp["contracts"].values() for r in group}
+        for group in inp["contracts"].values():
+            for r in group:
+                for k in ("providers", "consumers", "publishers", "subscribers", "writers", "readers"):
+                    cited |= {x["nodeId"] for x in r.get(k, [])}
+        self.assertTrue(cited)
+        self.assertEqual(cited, set(inp["nodes"]))
+        self.assertLessEqual(set(inp["nodes"]), graph_ids)
+        self.assertEqual(inp["nodes"]["table:workspace/dbo.LOG_RESUMO"]["member"], None)
+
+    def test_input_is_deterministic(self) -> None:
+        self._standard()
+        self.assertEqual(self._merge().returncode, 0)
+        before = self._bytes("intermediate/workspace-tour-input.json")
+        self.assertEqual(self._merge().returncode, 0)
+        self.assertEqual(self._bytes("intermediate/workspace-tour-input.json"), before)
+
+    def test_no_contracts_means_no_cross_service_links(self) -> None:
+        self._standard()
+        self.assertEqual(self._merge("--no-contracts").returncode, 0)
+        inp = self._input()
+        self.assertEqual(inp["crossServiceLinks"], 0)
+        self.assertEqual(inp["contracts"], {"endpoints": [], "channels": [], "tables": []})
+
+    def test_workspace_tour_citing_contract_nodes_survives_relink(self) -> None:
+        self._standard()
+        self.assertEqual(self._merge().returncode, 0)
+        top = self._input()["contracts"]["endpoints"][0]
+        step_ids = [top["consumers"][0]["nodeId"], top["id"], "concept:codeq/brain-relatorio-detalhado"]
+        (self.root / ".ua" / "workspace-tour.json").write_text(json.dumps(
+            [{"title": "Front to gestao", "description": "d", "nodeIds": step_ids}]), encoding="utf-8")
+        res = self._merge()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self._read("knowledge-graph.json")["tour"][0]["nodeIds"], step_ids)
+        res = self._link()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self._read("knowledge-graph.json")["tour"][0]["nodeIds"], step_ids)
+
+
 # ── Pure helpers ──────────────────────────────────────────────────────────
 
 class TestNormalizeRoute(unittest.TestCase):

@@ -414,6 +414,99 @@ class TestWorkspaceMerge(_WorkspaceCase):
         self.assertEqual(merged["project"]["description"], "Workspace of 1 services: only")
 
 
+# ── Workspace tour (system-level narrative) ───────────────────────────────
+
+class TestWorkspaceTour(_WorkspaceCase):
+    def _write_tour(self, steps: Any) -> None:
+        (self.root / ".ua").mkdir(exist_ok=True)
+        text = steps if isinstance(steps, str) else json.dumps(steps)
+        (self.root / ".ua" / "workspace-tour.json").write_text(text, encoding="utf-8")
+
+    def test_tour_input_is_written(self) -> None:
+        self._standard()
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        inp = self._out("intermediate/workspace-tour-input.json")
+        self.assertEqual(inp["workspace"], "cloudbi")
+        self.assertEqual(inp["outputLanguage"], "pt-BR")
+        self.assertEqual(inp["crossServiceLinks"], 0)  # no contracts.json in these members
+        self.assertEqual(inp["services"], {"links": []})
+        self.assertEqual(inp["contracts"], {"endpoints": [], "channels": [], "tables": []})
+        brain = inp["members"][0]
+        self.assertEqual([m["name"] for m in inp["members"]], ["brain", "motor"])
+        self.assertEqual(brain["description"], "Brain service")
+        self.assertEqual(brain["languages"], ["python", "typescript"])
+        self.assertEqual(brain["frameworks"], ["NestJS"])
+        self.assertEqual(brain["files"], 7)
+        # Largest layer first, namespaced ids.
+        self.assertEqual(brain["topLayers"][0], {"id": "layer:brain/core", "name": "Core", "nodes": 10})
+        self.assertEqual(brain["topLayers"][1]["id"], "layer:brain/api")
+        # Member tour step 1, namespaced; every mentioned id is indexed.
+        self.assertEqual(inp["members"][1]["tourStart"], ["file:motor/src/main.ts"])
+        self.assertEqual(inp["nodes"]["file:motor/src/main.ts"]["member"], "motor")
+        self.assertEqual(set(inp["nodes"]), {"file:brain/src/main.ts", "file:motor/src/main.ts"})
+
+    def test_absent_tour_leaves_member_tours_unchanged(self) -> None:
+        self._standard()
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual([s["title"] for s in self._out("knowledge-graph.json")["tour"]],
+                         ["brain", "Start", "Run", "motor", "Start", "Run"])
+
+    def test_workspace_tour_goes_first_and_drops_unknown_ids(self) -> None:
+        self._standard()
+        self._write_tour([
+            {"order": 2, "title": "Motor", "description": "then motor",
+             "nodeIds": ["file:motor/src/main.ts", "file:motor/ghost.ts"]},
+            {"order": 1, "title": "Request path", "description": "brain calls motor",
+             "nodeIds": ["file:brain/src/main.ts", "config:motor/package.json"],
+             "languageLesson": "HTTP between services"},
+        ])
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("dropped unknown node 'file:motor/ghost.ts'", res.stderr)
+        tour = self._out("knowledge-graph.json")["tour"]
+        self.assertEqual([s["title"] for s in tour],
+                         ["Request path", "Motor", "brain", "Start", "Run", "motor", "Start", "Run"])
+        self.assertEqual([s["order"] for s in tour], list(range(1, 9)))
+        self.assertEqual(tour[0]["nodeIds"], ["file:brain/src/main.ts", "config:motor/package.json"])
+        self.assertEqual(tour[0]["languageLesson"], "HTTP between services")
+        self.assertEqual(tour[1]["nodeIds"], ["file:motor/src/main.ts"])
+        self.assertEqual(tour[3]["nodeIds"], ["file:brain/src/main.ts"])
+        self.assertIn("Workspace tour: 2 steps", res.stdout)
+
+    def test_workspace_tour_rerun_is_idempotent(self) -> None:
+        self._standard()
+        self._write_tour({"steps": [{"title": "Only", "description": "d", "nodeIds": ["file:brain/src/main.ts"]}]})
+        self.assertEqual(self._run().returncode, 0)
+        t1 = self._out("knowledge-graph.json")["tour"]
+        self.assertEqual(self._run().returncode, 0)
+        self.assertEqual(self._out("knowledge-graph.json")["tour"], t1)
+        self.assertEqual(len(t1), 7)
+
+    def test_unusable_tour_file_is_ignored_with_warning(self) -> None:
+        self._standard()
+        for raw in ("{broken", json.dumps({"title": "not an array"})):
+            with self.subTest(raw=raw):
+                self._write_tour(raw)
+                res = self._run()
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn("workspace tour ignored", res.stderr)
+                self.assertEqual(self._out("knowledge-graph.json")["tour"][0]["title"], "brain")
+
+    def test_steps_without_title_are_skipped(self) -> None:
+        self._standard()
+        self._write_tour([{"description": "no title", "nodeIds": []},
+                          {"title": "Kept", "nodeIds": ["file:brain/src/main.ts", 7]}])
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("step[0] has no title", res.stderr)
+        tour = self._out("knowledge-graph.json")["tour"]
+        self.assertEqual(tour[0], {"title": "Kept", "description": "",
+                                   "nodeIds": ["file:brain/src/main.ts"], "order": 1})
+        self.assertEqual(tour[1]["title"], "brain")
+
+
 # ── Final validation (plugin inline-validator rules) ──────────────────────
 
 def _valid_graph() -> dict[str, Any]:

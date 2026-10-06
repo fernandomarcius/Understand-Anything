@@ -32,6 +32,14 @@ Output:
     <ua-dir>/config.json            first member's outputLanguage, only when
                                     the workspace config does not set one
     <ua-dir>/contracts-report.json  linker report; removed when `--no-contracts`
+    <ua-dir>/intermediate/workspace-tour-input.json
+                                    deterministic input for the workspace (system)
+                                    tour: members, service links, top contracts
+
+When `<ua-dir>/workspace-tour.json` exists (array of `{title, description,
+nodeIds, languageLesson?}`, written by the tour-builder agent from that input),
+its steps go first in `tour`, before the member tours; node ids missing from the
+graph are dropped (one warning each) and `order` is renumbered 1..N.
 
 Exits non-zero and writes nothing when the manifest is invalid, a member graph
 is missing or unparsable, the node-count invariant does not hold or the final
@@ -479,7 +487,309 @@ def assert_valid_workspace_graph(graph: dict[str, Any]) -> None:
         "nothing written:\n  - " + "\n  - ".join(shown) + (f"\n  ... and {more} more" if more else ""))
 
 
+# ── Workspace tour (system-level narrative) ─────────────────────────────────
+
+WORKSPACE_TOUR_NAME = "workspace-tour.json"
+WORKSPACE_TOUR_INPUT_NAME = "workspace-tour-input.json"
+TOUR_INPUT_TOP_LAYERS = 5
+TOUR_INPUT_TOP_CONTRACTS = 10
+
+
+def _member_of_id(nid: Any, members: set[str]) -> str | None:
+    """Member owning a namespaced id (`file:M/a`, `M/x`); None if the segment is not a member."""
+    if not isinstance(nid, str):
+        return None
+    rest = nid.partition(":")[2] if ":" in nid else nid
+    head, sep, _tail = rest.partition("/")
+    return head if sep and head in members else None
+
+
+def _is_shared_contract_node(node: dict[str, Any]) -> bool:
+    """Linker-created channels / shared tables belong to no member (core `isSharedContractNode`)."""
+    tags = node.get("tags")
+    return node.get("type") in {"concept", "table"} and isinstance(tags, list) and "contract" in tags
+
+
+def build_service_links(graph: dict[str, Any], members: list[str]) -> list[dict[str, Any]]:
+    """Member → member links aggregated by kind (port of core `buildServiceGraph` links).
+
+    `calls`: cross-member `calls` edges; `messages`: channels the source publishes
+    and the target subscribes to; `tables`: shared tables (writer → reader when
+    only one side writes, else manifest order).
+    """
+    member_set = set(members)
+    nodes_by_id = {n.get("id"): n for n in graph.get("nodes", []) if isinstance(n, dict)}
+
+    def member_of(nid: Any) -> str | None:
+        node = nodes_by_id.get(nid)
+        if node is not None and _is_shared_contract_node(node):
+            return None
+        return _member_of_id(nid, member_set)
+
+    links: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def link(source: str, target: str) -> dict[str, Any]:
+        return links.setdefault((source, target),
+                                {"source": source, "target": target, "calls": 0, "messages": 0, "tables": 0})
+
+    hubs: dict[str, dict[str, set[str]]] = {k: {} for k in ("publishes", "subscribes", "writes_to", "reads_from")}
+    for e in graph.get("edges", []):
+        if not isinstance(e, dict):
+            continue
+        sm = member_of(e.get("source"))
+        if not sm:
+            continue
+        etype = e.get("type")
+        if etype == "calls":
+            tm = member_of(e.get("target"))
+            if tm and tm != sm:
+                link(sm, tm)["calls"] += 1
+        elif etype in hubs and isinstance(e.get("target"), str):
+            hubs[etype].setdefault(e["target"], set()).add(sm)
+
+    for channel, pubs in hubs["publishes"].items():
+        for p in pubs:
+            for s in hubs["subscribes"].get(channel, set()):
+                if p != s:
+                    link(p, s)["messages"] += 1
+
+    order = {m: i for i, m in enumerate(members)}
+    writers, readers = hubs["writes_to"], hubs["reads_from"]
+    for table in sorted(set(writers) | set(readers)):
+        w, r = writers.get(table, set()), readers.get(table, set())
+        touching = sorted(w | r, key=lambda m: order[m])
+        for i in range(len(touching)):
+            for j in range(i + 1, len(touching)):
+                a, b = touching[i], touching[j]
+                if a not in w and b in w:
+                    a, b = b, a
+                link(a, b)["tables"] += 1
+
+    return sorted(links.values(), key=lambda l: (order[l["source"]], order[l["target"]]))
+
+
+def _first_tour_step(tour: Any) -> dict[str, Any] | None:
+    steps = [s for s in tour if isinstance(s, dict)] if isinstance(tour, list) else []
+    if not steps:
+        return None
+    return min(enumerate(steps), key=lambda ix: (
+        ix[1]["order"] if isinstance(ix[1].get("order"), (int, float)) and not isinstance(ix[1].get("order"), bool)
+        else float("inf"), ix[0]))[1]
+
+
+def build_workspace_tour_input(
+    merged: dict[str, Any],
+    loaded: list[tuple[dict[str, Any], dict[str, Any]]],
+    output_language: str | None = None,
+) -> dict[str, Any]:
+    """Deterministic input for the workspace tour (tour-builder, system tour).
+
+    members (description, languages, file count, top layers, first tour step's
+    nodeIds), the member → member service links, the top cross-service contracts
+    (endpoints by consumers, channels, shared tables) and a `nodes` index with
+    every node id the input mentions — the only ids the tour may use.
+    """
+    names = [m["name"] for m, _g in loaded]
+    member_set = set(names)
+    nodes_by_id = {n.get("id"): n for n in merged["nodes"] if isinstance(n, dict)}
+    mentioned: set[str] = set()
+
+    def mention(nid: Any) -> bool:
+        if isinstance(nid, str) and nid in nodes_by_id:
+            mentioned.add(nid)
+            return True
+        return False
+
+    members_out: list[dict[str, Any]] = []
+    for member, graph in loaded:
+        mname = member["name"]
+        project = graph.get("project") if isinstance(graph.get("project"), dict) else {}
+        description = project.get("description")
+        layers = [l for l in graph.get("layers", []) or [] if isinstance(l, dict)]
+        ranked = sorted(enumerate(layers), key=lambda il: (
+            -len(il[1].get("nodeIds") or []) if isinstance(il[1].get("nodeIds"), list) else 0, il[0]))
+        top_layers = [{"id": namespace_id(mname, l.get("id")), "name": l.get("name", ""),
+                       "nodes": len(l["nodeIds"]) if isinstance(l.get("nodeIds"), list) else 0}
+                      for _i, l in ranked[:TOUR_INPUT_TOP_LAYERS]]
+        first = _first_tour_step(graph.get("tour"))
+        start = [nid for nid in _namespace_ids(mname, (first or {}).get("nodeIds") or []) if mention(nid)]
+        members_out.append({
+            "name": mname,
+            "description": description if isinstance(description, str) else "",
+            "languages": sorted(_str_list(project.get("languages"))),
+            "frameworks": sorted(_str_list(project.get("frameworks"))),
+            "files": sum(1 for n in graph.get("nodes", []) if isinstance(n, dict)
+                         and n.get("type") in FILE_LEVEL_TYPES),
+            "topLayers": top_layers,
+            "tourStart": start,
+        })
+
+    def owner(nid: Any) -> str | None:
+        node = nodes_by_id.get(nid)
+        if node is not None and _is_shared_contract_node(node):
+            return None
+        return _member_of_id(nid, member_set)
+
+    order = {m: i for i, m in enumerate(names)}
+
+    def side(entries: set[tuple[str, str]]) -> list[dict[str, str]]:
+        return [{"member": m, "nodeId": nid}
+                for m, nid in sorted(entries, key=lambda mn: (order.get(mn[0], len(order)), mn[1]))]
+
+    endpoints: dict[str, dict[str, set[tuple[str, str]]]] = {}
+    channels: dict[str, dict[str, set[tuple[str, str]]]] = {}
+    tables: dict[str, dict[str, set[tuple[str, str]]]] = {}
+    routes_into: dict[str, set[tuple[str, str]]] = {}
+    for e in merged["edges"]:
+        if not isinstance(e, dict):
+            continue
+        src, tgt, etype = e.get("source"), e.get("target"), e.get("type")
+        sm = owner(src)
+        if not sm or not isinstance(tgt, str):
+            continue
+        if etype == "calls":
+            tm = owner(tgt)
+            if tm and tm != sm and (nodes_by_id.get(tgt) or {}).get("type") == "endpoint":
+                endpoints.setdefault(tgt, {"consumers": set()})["consumers"].add((sm, src))
+        elif etype == "routes":
+            routes_into.setdefault(tgt, set()).add((sm, src))
+        elif etype in ("publishes", "subscribes") and _is_shared_contract_node(nodes_by_id.get(tgt) or {}):
+            key = "publishers" if etype == "publishes" else "subscribers"
+            channels.setdefault(tgt, {"publishers": set(), "subscribers": set()})[key].add((sm, src))
+        elif etype in ("writes_to", "reads_from") and _is_shared_contract_node(nodes_by_id.get(tgt) or {}):
+            key = "writers" if etype == "writes_to" else "readers"
+            tables.setdefault(tgt, {"writers": set(), "readers": set()})[key].add((sm, src))
+
+    def node_name(nid: str) -> str:
+        name = (nodes_by_id.get(nid) or {}).get("name")
+        return name if isinstance(name, str) else nid
+
+    endpoint_rows = []
+    for nid, data in endpoints.items():
+        consumers = data["consumers"]
+        endpoint_rows.append({
+            "id": nid, "name": node_name(nid), "member": owner(nid),
+            "providers": side(routes_into.get(nid, set())),
+            "consumers": side(consumers),
+            "consumerMembers": len({m for m, _ in consumers}),
+        })
+    endpoint_rows.sort(key=lambda r: (-r["consumerMembers"], -len(r["consumers"]), r["id"]))
+
+    channel_rows = [{"id": nid, "name": node_name(nid),
+                     "publishers": side(d["publishers"]), "subscribers": side(d["subscribers"])}
+                    for nid, d in channels.items()]
+    channel_rows.sort(key=lambda r: (-len({x["member"] for x in r["publishers"] + r["subscribers"]}),
+                                     -(len(r["publishers"]) + len(r["subscribers"])), r["id"]))
+
+    table_rows = [{"id": nid, "name": node_name(nid), "writers": side(d["writers"]), "readers": side(d["readers"])}
+                  for nid, d in tables.items()]
+    table_rows.sort(key=lambda r: (-len({x["member"] for x in r["writers"] + r["readers"]}),
+                                   -(len(r["writers"]) + len(r["readers"])), r["id"]))
+
+    contracts = {"endpoints": endpoint_rows[:TOUR_INPUT_TOP_CONTRACTS],
+                 "channels": channel_rows[:TOUR_INPUT_TOP_CONTRACTS],
+                 "tables": table_rows[:TOUR_INPUT_TOP_CONTRACTS]}
+    for group, rows in contracts.items():
+        for row in rows:
+            mention(row["id"])
+            for k in ("providers", "consumers", "publishers", "subscribers", "writers", "readers"):
+                for entry in row.get(k, []):
+                    mention(entry["nodeId"])
+
+    links = build_service_links(merged, names)
+    nodes_index = {}
+    for nid in sorted(mentioned):
+        n = nodes_by_id[nid]
+        nodes_index[nid] = {"type": n.get("type"), "name": n.get("name"), "member": owner(nid),
+                            "summary": n.get("summary", "") if isinstance(n.get("summary"), str) else ""}
+    out: dict[str, Any] = {
+        "version": 1,
+        "workspace": merged["project"]["workspace"]["name"],
+        "crossServiceLinks": sum(l["calls"] + l["messages"] + l["tables"] for l in links),
+        "members": members_out,
+        "services": {"links": links},
+        "contracts": contracts,
+        "nodes": nodes_index,
+    }
+    if output_language:
+        out["outputLanguage"] = output_language
+    return out
+
+
+def load_workspace_tour(ua_dir: Path) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    """Read `<ua>/workspace-tour.json` → (steps | None when absent/unusable, warnings).
+
+    Accepts a plain array (the contract) or a `{ "steps": [...] }` envelope.
+    Steps need a string `title`; `nodeIds` entries must be strings.
+    """
+    path = ua_dir / WORKSPACE_TOUR_NAME
+    if not path.is_file():
+        return None, []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return None, [f"{path} is not valid JSON ({e}); workspace tour ignored"]
+    if isinstance(data, dict) and isinstance(data.get("steps"), list):
+        data = data["steps"]
+    if not isinstance(data, list):
+        return None, [f"{path} must be an array of steps; workspace tour ignored"]
+    ranked: list[tuple[float, int, dict[str, Any]]] = []
+    warnings: list[str] = []
+    for i, raw in enumerate(data):
+        if not isinstance(raw, dict) or not isinstance(raw.get("title"), str) or not raw["title"].strip():
+            warnings.append(f"workspace tour step[{i}] has no title; skipped")
+            continue
+        step: dict[str, Any] = {
+            "title": raw["title"],
+            "description": raw.get("description") if isinstance(raw.get("description"), str) else "",
+            "nodeIds": [n for n in raw.get("nodeIds") or [] if isinstance(n, str)]
+            if isinstance(raw.get("nodeIds"), list) else [],
+        }
+        if isinstance(raw.get("languageLesson"), str) and raw["languageLesson"]:
+            step["languageLesson"] = raw["languageLesson"]
+        o = raw.get("order")
+        ranked.append((o if isinstance(o, (int, float)) and not isinstance(o, bool) else float("inf"), i, step))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    return [s for _o, _i, s in ranked], warnings
+
+
+def apply_workspace_tour(graph: dict[str, Any], steps: list[dict[str, Any]]) -> list[str]:
+    """Put `steps` before the member tours, drop unknown nodeIds, renumber `order` 1..N.
+
+    Returns one warning per dropped node id.
+    """
+    ids = {n.get("id") for n in graph["nodes"] if isinstance(n, dict)}
+    warnings: list[str] = []
+    placed: list[dict[str, Any]] = []
+    for step in steps:
+        kept = []
+        for nid in step["nodeIds"]:
+            if nid in ids:
+                if nid not in kept:
+                    kept.append(nid)
+            else:
+                warnings.append(f"workspace tour step '{step['title']}': dropped unknown node '{nid}'")
+        placed.append({**step, "nodeIds": kept})
+    member_tour = graph["tour"] if isinstance(graph.get("tour"), list) else []
+    graph["tour"] = placed + member_tour
+    for i, step in enumerate(graph["tour"], start=1):
+        if isinstance(step, dict):
+            step["order"] = i
+    return warnings
+
+
 # ── Output ──────────────────────────────────────────────────────────────────
+
+def workspace_output_language(ua_dir: Path, config_to_write: dict[str, Any] | None) -> str | None:
+    """The `outputLanguage` the workspace config holds after this merge."""
+    if config_to_write is not None:
+        return config_to_write.get("outputLanguage")
+    try:
+        lang = json.loads((ua_dir / "config.json").read_text(encoding="utf-8")).get("outputLanguage")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    return lang if isinstance(lang, str) and lang else None
+
 
 def _atomic_write_json(path: Path, data: Any) -> None:
     tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -540,6 +850,8 @@ def main() -> None:
     linker = None
     contracts_report = None
     link_warnings: list[str] = []
+    tour_warnings: list[str] = []
+    ws_tour = None
     try:
         if not root.is_dir():
             raise WorkspaceError(f"workspace root {root} is not a directory")
@@ -558,19 +870,22 @@ def main() -> None:
         if not no_contracts:
             linker = load_contract_linker()
             contracts_report, link_warnings = linker.link_workspace(merged, members, manifest)
+        ua_dir = resolve_ua_dir(root)
+        ws_tour, tour_warnings = load_workspace_tour(ua_dir)
+        if ws_tour is not None:
+            tour_warnings += apply_workspace_tour(merged, ws_tour)
         assert_valid_workspace_graph(merged)
     except WorkspaceError as e:
-        for w in link_warnings:
+        for w in link_warnings + tour_warnings:
             print(f"Warning: {w}", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     for line in report:
         print(line, file=sys.stderr)
-    for w in link_warnings:
+    for w in link_warnings + tour_warnings:
         print(f"Warning: {w}", file=sys.stderr)
 
-    ua_dir = resolve_ua_dir(root)
     ua_dir.mkdir(parents=True, exist_ok=True)
     project = merged["project"]
     meta = {
@@ -580,7 +895,10 @@ def main() -> None:
         "analyzedFiles": sum(1 for n in merged["nodes"] if n.get("type") in FILE_LEVEL_TYPES),
         "workspace": True,
     }
-    config = build_config(ua_dir, load_member_output_language(members[0]))
+    member_language = load_member_output_language(members[0])
+    config = build_config(ua_dir, member_language)
+    tour_input = build_workspace_tour_input(
+        merged, loaded, workspace_output_language(ua_dir, config) or member_language)
 
     _atomic_write_json(ua_dir / "knowledge-graph.json", merged)
     _atomic_write_json(ua_dir / "meta.json", meta)
@@ -592,6 +910,8 @@ def main() -> None:
     elif report_path.exists():
         # --no-contracts: a report from an earlier linked merge no longer describes this graph.
         report_path.unlink()
+    (ua_dir / "intermediate").mkdir(exist_ok=True)
+    _atomic_write_json(ua_dir / "intermediate" / WORKSPACE_TOUR_INPUT_NAME, tour_input)
 
     for m in project["workspace"]["members"]:
         commit = str(m["gitCommitHash"])[:7] or "?"
@@ -602,6 +922,12 @@ def main() -> None:
           f"({len(report)} dropped edges) -> {ua_dir / 'knowledge-graph.json'}")
     if linker is not None and contracts_report is not None:
         print(linker.summary_line(contracts_report, report_path))
+    tour_input_path = ua_dir / "intermediate" / WORKSPACE_TOUR_INPUT_NAME
+    if ws_tour is not None:
+        print(f"Workspace tour: {len(ws_tour)} steps from {ua_dir / WORKSPACE_TOUR_NAME} placed first "
+              f"({len(tour_warnings)} warnings); tour input -> {tour_input_path}")
+    else:
+        print(f"Workspace tour input: {tour_input['crossServiceLinks']} cross-service links -> {tour_input_path}")
 
 
 if __name__ == "__main__":

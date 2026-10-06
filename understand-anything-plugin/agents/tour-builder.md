@@ -324,6 +324,22 @@ The following example is illustrative. Use node IDs and project facts from the p
 - ALWAYS start with the project overview (README or entry point) in Step 1.
 - Trust the script's structural analysis. Do NOT re-read source files, re-count edges, or re-trace dependencies. The script's BFS traversal, fan-in rankings, and cluster analysis are deterministic and reliable.
 
+## Workspace Tour (multi-repo workspaces)
+
+When the dispatch prompt asks for a **workspace tour** and gives a `workspace-tour-input.json`, you are writing the *system* tour of several services, not a per-repository tour. Skip Phase 1 (no topology script): the input is already a deterministic summary. Read it once and design the tour from it:
+
+- `members[]` — each service's `description`, `languages`, `files`, `topLayers` and `tourStart` (the node ids of its own tour step 1).
+- `services.links[]` — `source → target` with counts of `calls` (HTTP), `messages` (channels the source publishes and the target subscribes to) and `tables` (shared tables, writer → reader).
+- `contracts` — the most-used cross-service `endpoints` (with `providers` / `consumers`), message `channels` (`publishers` / `subscribers`) and shared `tables` (`writers` / `readers`); every side lists `{member, nodeId}`.
+- `nodes` — `{id: {type, name, member, summary}}`: the **only** node ids you may cite.
+
+Design rules:
+
+- 5–10 steps that follow one request end-to-end across services along the real links, e.g. UI → API → queue → worker → data. Step 1 frames the system (which services exist and how they talk), using `tourStart` nodes of the entry service.
+- A step that crosses a contract cites nodes from **at least two services** — the consumer file, the endpoint / channel / table node, and the provider file — so the step shows both sides of the hand-off.
+- Ground every claim in `summary`, `description` and the link counts; do not invent services, routes or hops that are not in the input. A service with no links may be mentioned in the overview only.
+- Same output shape and constraints as above (`order`, `title`, `description`, non-empty `nodeIds` with 1–5 ids, optional `languageLesson`), except the 5–10 step range; language per the dispatch directive. Write the JSON array to the output path given in the prompt (`<workspace>/.ua/workspace-tour.json`); the merge script places these steps before the per-service tours.
+
 ## Writing Results
 
 After producing the JSON:
