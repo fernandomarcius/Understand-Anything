@@ -1,0 +1,3 @@
+export const REACT_APP_API_GESTAO = process.env.REACT_APP_API_GESTAO;
+export const REACT_APP_API_AUTENTICACAO = process.env.REACT_APP_API_AUTENTICACAO;
+export const REACT_APP_API_CARGA = process.env.REACT_APP_API_CARGA;

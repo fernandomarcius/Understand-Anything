@@ -1,0 +1,16 @@
+version: '3.4'
+services:
+  loja-api:
+    image: loja-api
+    build:
+      context: .
+      args:
+        - BUILD_URL=http://builder.local:9000
+    hostname: loja-api.interno
+    ports:
+      - "8082:8080"
+    environment:
+      - CFLOW_API=https://cflow.local:8443
+      - DB_PASSWORD=supersecret-db
+      - ConnectionStrings__Default=Server=db;User Id=sa;Password=supersecret-conn
+      - LOG_LEVEL=Information

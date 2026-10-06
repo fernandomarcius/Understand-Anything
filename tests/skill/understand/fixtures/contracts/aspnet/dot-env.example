@@ -1,0 +1,5 @@
+# local defaults
+CODEQ_URL=http://codeq:8080
+CODEQ_PRODUCER_TOKEN=supersecret-token
+TRINO=172.16.50.47:5004
+ACCESS_JWT=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl

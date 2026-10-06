@@ -1,0 +1,9 @@
+services:
+  front:
+    build:
+      context: .
+      args:
+        - REACT_APP_API_GESTAO=http://172.16.50.47:8082/api
+        - PUBLIC_URL=${PUBLIC_URL:-}
+    ports:
+      - 8001:8080

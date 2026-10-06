@@ -19,6 +19,7 @@ export default defineConfig({
     exclude: [
       '**/node_modules/**',
       '**/dist/**',
+      'tests/**/fixtures/**',
       'understand-anything-plugin/packages/core/**',
     ],
   },
