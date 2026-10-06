@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -1232,6 +1232,96 @@ describe('extract-import-map.mjs — C# resolver', () => {
       'MyApp/Models/User.cs',
       'MyApp/Util/Helper.cs',
     ]);
+  });
+
+  // Fixture: a two-project solution (Shop.Core + Shop.Api) whose namespaces
+  // do NOT mirror the directory layout, exercising namespace-based resolution.
+  const CS_FIXTURE = resolve(__dirname, 'fixtures/csharp-solution');
+  const CS_FILES = [
+    'Shop.sln',
+    'Shop.Core/Shop.Core.csproj',
+    'Shop.Core/GlobalUsings.cs',
+    'Shop.Core/Common/Guard.cs',
+    'Shop.Core/Domain/Order.cs',
+    'Shop.Core/Domain/Money.cs',
+    'Shop.Core/Domain/UnusedPolicy.cs',
+    'Shop.Core/Math/Calc.cs',
+    'Shop.Core/Infra.cs',
+    'Shop.Core/Migrations/20240101_Init.Designer.cs',
+    'Shop.Api/Shop.Api.csproj',
+    'Shop.Api/AppSettings.cs',
+    'Shop.Api/Controllers/OrdersController.cs',
+    'Shop.Api/obj/Debug/net8.0/Shop.Api.AssemblyInfo.cs',
+  ];
+
+  function csInventory() {
+    return CS_FILES.map(path => {
+      if (path.endsWith('.cs')) return { path, language: 'csharp', fileCategory: 'code' };
+      if (path.endsWith('.csproj')) return { path, language: 'csproj', fileCategory: 'config' };
+      return { path, language: 'unknown', fileCategory: 'config' };
+    });
+  }
+
+  function runCsFixture(extraInput = {}) {
+    projectRoot = mkdtempSync(join(tmpdir(), 'ua-eim-cs-'));
+    cpSync(CS_FIXTURE, projectRoot, { recursive: true });
+    return runScript(projectRoot, { projectRoot, files: csInventory(), ...extraInput });
+  }
+
+  it('resolves using/using static/alias/parent-namespace references to declaring files', () => {
+    const result = runCsFixture();
+    expect(result.status).toBe(0);
+    // Order (using Shop.Core.Domain), Calc (using static), Infra.cs declares
+    // Clock (alias target, nested block namespaces), AppSettings (parent
+    // namespace Shop.Api, no using), Money declares Currency referenced inside
+    // an interpolated-string hole. UnusedPolicy is only named in a comment and
+    // a string: no edge. GeneratedMarker lives under obj/: no edge. Guard is
+    // reachable only via Shop.Core's global using, which does not apply to
+    // Shop.Api: no edge.
+    expect(result.output.importMap['Shop.Api/Controllers/OrdersController.cs']).toEqual([
+      'Shop.Api/AppSettings.cs',
+      'Shop.Core/Domain/Money.cs',
+      'Shop.Core/Domain/Order.cs',
+      'Shop.Core/Infra.cs',
+      'Shop.Core/Math/Calc.cs',
+    ]);
+  });
+
+  it('links same-namespace types and project-scoped global usings', () => {
+    const result = runCsFixture();
+    expect(result.status).toBe(0);
+    // Money: same file-scoped namespace, no using. Guard: global using in the
+    // same project. Strings/comments mentioning IUnusedPolicy do not count.
+    expect(result.output.importMap['Shop.Core/Domain/Order.cs']).toEqual([
+      'Shop.Core/Common/Guard.cs',
+      'Shop.Core/Domain/Money.cs',
+    ]);
+  });
+
+  it('never links unreferenced types, self, or generated files', () => {
+    const result = runCsFixture();
+    expect(result.status).toBe(0);
+    const map = result.output.importMap;
+    for (const [src, targets] of Object.entries(map)) {
+      expect(targets).not.toContain(src);
+      expect(targets).not.toContain('Shop.Core/Domain/UnusedPolicy.cs');
+      expect(targets).not.toContain('Shop.Api/obj/Debug/net8.0/Shop.Api.AssemblyInfo.cs');
+      expect(targets).not.toContain('Shop.Core/Migrations/20240101_Init.Designer.cs');
+    }
+    expect(map['Shop.Core/Infra.cs']).toEqual([]);
+    expect(map['Shop.Core/Domain/Money.cs']).toEqual([]);
+    expect(map['Shop.Core/GlobalUsings.cs']).toEqual([]);
+    expect(map['Shop.Api/obj/Debug/net8.0/Shop.Api.AssemblyInfo.cs']).toEqual([]);
+    expect(map['Shop.Core/Migrations/20240101_Init.Designer.cs']).toEqual([]);
+    expect(result.output.stats).toEqual({ filesScanned: 14, filesWithImports: 2, totalEdges: 7 });
+  });
+
+  it('builds the namespace index from the full inventory when analysisPaths is narrowed', () => {
+    const result = runCsFixture({ analysisPaths: ['Shop.Core/Domain/Order.cs'] });
+    expect(result.status).toBe(0);
+    expect(result.output.importMap).toEqual({
+      'Shop.Core/Domain/Order.cs': ['Shop.Core/Common/Guard.cs', 'Shop.Core/Domain/Money.cs'],
+    });
   });
 });
 

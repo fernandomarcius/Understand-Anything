@@ -633,13 +633,13 @@ async function buildResolutionContext(projectRoot, files) {
   }
 
   // Build per-extension suffix indices for dotted-FQN resolvers (Java,
-  // Kotlin, Scala, C#). Indexed once; reused for every import dispatch.
+  // Kotlin, Scala). Indexed once; reused for every import dispatch. C# is
+  // namespace-based and gets its own index (buildCSharpIndex) in main().
   const javaIndex = buildSuffixIndex(files, p => p.endsWith('.java'));
   const kotlinIndex = buildSuffixIndex(files, p => p.endsWith('.kt'));
   const scalaFilePredicate = p => p.endsWith('.scala') || p.endsWith('.sc');
   const scalaIndex = buildSuffixIndex(files, scalaFilePredicate);
   const scalaPackageIndex = buildPackageIndex(files, scalaFilePredicate);
-  const csIndex = buildSuffixIndex(files, p => p.endsWith('.cs'));
   const swiftModuleIndex = buildSwiftModuleIndex(files, swiftResult.targets);
 
   return {
@@ -652,7 +652,6 @@ async function buildResolutionContext(projectRoot, files) {
     kotlinIndex,
     scalaIndex,
     scalaPackageIndex,
-    csIndex,
     swiftModuleIndex,
     failures: [
       ...tsResult.failures,
@@ -1290,7 +1289,7 @@ function buildSwiftModuleIndex(files, packageTargets) {
 /**
  * Resolve a dotted-import to a file. `fqn` is the qualified name
  * (`com.example.Foo`); `ext` is the file extension to probe (`.java`,
- * `.kt`, `.cs`). Wildcards (e.g. `com.example.*`) and the trailing `*` in
+ * `.kt`, `.scala`). Wildcards (e.g. `com.example.*`) and the trailing `*` in
  * Java's `com.example.*` are stripped before resolution — there is no good
  * single-file resolution for wildcards, so we drop them. (Tree-sitter
  * already exposes `*` as a specifier; the source field strips it.)
@@ -1407,16 +1406,454 @@ function compareScalaPackageMembers(a, b) {
 }
 
 // ---------------------------------------------------------------------------
-// C# resolver
+// C# resolver (namespace-based)
 //
-// C# `using Foo.Bar;` declarations are typically NAMESPACES, not files, and
-// the C# convention is namespace = directory (loose). Tree-sitter's C#
-// extractor captures these as imports with the dotted source. We probe the
-// dotted path against the .cs index the same way Java/Kotlin do.
+// C# has no file-level imports: `using A.B.C;` brings a NAMESPACE into scope,
+// and a namespace is declared per file (`namespace A.B.C;` file-scoped or
+// `namespace A.B.C { ... }` block-scoped), usually spanning many files and
+// often several .csproj projects of one solution. Namespaces rarely mirror
+// the directory layout (`namespace Api_Foo.Application` under `API/Application/`),
+// so probing `A/B/C.cs` as a path (the Java/Kotlin strategy) resolves nothing.
+//
+// Strategy (deterministic, no tree-sitter needed):
+//   1. Read every .cs file of the inventory once and build
+//      namespace -> typeName -> [files] from top-level type declarations
+//      (class/interface/struct/enum/record/delegate).
+//   2. For each file, the visible namespaces are: its own namespaces and all
+//      of their parents (C# lookup walks enclosing namespaces), the global
+//      namespace, its `using` namespaces, and the `global using` namespaces of
+//      its project (nearest ancestor .csproj; the whole repo when none).
+//   3. An edge exists only when the file actually references an identifier
+//      that a visible namespace declares — `using X;` alone links nothing, so a
+//      big namespace does not explode into edges to every member file.
+//      `using static X.Y.T;` links T's file directly; `using A = X.Y.T;` links
+//      T's file when `A` is used; fully qualified `X.Y.T` references resolve
+//      without any using.
+//   4. Comments, string contents and preprocessor lines are ignored
+//      (interpolation holes are code). Generated sources — anything under a
+//      bin/ or obj/ folder, and Migrations/*.Designer.cs — are neither indexed
+//      nor given edges. Self-edges are dropped.
 // ---------------------------------------------------------------------------
 
-export function resolveCSharpImport(rawImport, _file, ctx) {
-  return resolveDottedFqn(rawImport, '.cs', ctx.csIndex);
+/** True for generated C# sources that must not take part in the import map. */
+export function isGeneratedCSharpPath(p) {
+  const parts = p.split('/');
+  const dirs = parts.slice(0, -1).map(s => s.toLowerCase());
+  if (dirs.includes('bin') || dirs.includes('obj')) return true;
+  return parts[parts.length - 1].endsWith('.Designer.cs') && dirs.includes('migrations');
+}
+
+/**
+ * Return the code of a C# source with comments, string/char literal contents
+ * and preprocessor lines blanked out. Interpolation holes (`$"{expr}"`) are
+ * kept as code, with their braces blanked so namespace brace-depth tracking is
+ * not disturbed.
+ */
+export function stripCSharpNoise(src) {
+  const out = [];
+  const n = src.length;
+  let i = 0;
+
+  function skipCharLiteral() {
+    i++; // opening '
+    while (i < n && src[i] !== "'" && src[i] !== '\n') {
+      if (src[i] === '\\') i++;
+      i++;
+    }
+    i++; // closing '
+    out.push(' ');
+  }
+
+  // Scan an interpolation hole up to (not including) its closing brace.
+  function scanHole() {
+    out.push(' ');
+    scanCode(true);
+    out.push(' ');
+  }
+
+  function scanString() {
+    let dollars = 0;
+    let verbatim = false;
+    while (src[i] === '$' || src[i] === '@') {
+      if (src[i] === '$') dollars++;
+      else verbatim = true;
+      i++;
+    }
+    let quotes = 0;
+    while (src[i + quotes] === '"') quotes++;
+
+    if (!verbatim && quotes >= 3) {
+      // Raw string literal: ends at the same number of consecutive quotes.
+      i += quotes;
+      while (i < n) {
+        if (src[i] === '"') {
+          let k = 0;
+          while (src[i + k] === '"') k++;
+          i += k;
+          if (k >= quotes) break;
+          continue;
+        }
+        if (dollars > 0 && src[i] === '{') {
+          let k = 0;
+          while (src[i + k] === '{') k++;
+          i += k;
+          if (k >= dollars) {
+            scanHole();
+            while (i < n && src[i] === '}') i++;
+          }
+          continue;
+        }
+        i++;
+      }
+      out.push(' ');
+      return;
+    }
+
+    i++; // opening quote
+    while (i < n) {
+      const c = src[i];
+      if (c === '"') {
+        if (verbatim && src[i + 1] === '"') { i += 2; continue; }
+        i++;
+        break;
+      }
+      if (!verbatim && c === '\\') { i += 2; continue; }
+      if (!verbatim && c === '\n') break; // unterminated literal: stop at EOL
+      if (dollars > 0 && c === '{') {
+        if (src[i + 1] === '{') { i += 2; continue; }
+        i++;
+        scanHole();
+        if (src[i] === '}') i++;
+        continue;
+      }
+      i++;
+    }
+    out.push(' ');
+  }
+
+  function startsString(at) {
+    let j = at;
+    while (src[j] === '$' || src[j] === '@') j++;
+    return src[j] === '"';
+  }
+
+  function scanCode(stopAtBrace) {
+    let depth = 0;
+    while (i < n) {
+      const c = src[i];
+      const d = src[i + 1];
+      if (c === '/' && d === '/') {
+        while (i < n && src[i] !== '\n') i++;
+        continue;
+      }
+      if (c === '/' && d === '*') {
+        const end = src.indexOf('*/', i + 2);
+        i = end < 0 ? n : end + 2;
+        out.push(' ');
+        continue;
+      }
+      if (c === '#') {
+        while (i < n && src[i] !== '\n') i++;
+        continue;
+      }
+      if (c === "'") { skipCharLiteral(); continue; }
+      if (c === '"' || ((c === '$' || c === '@') && startsString(i))) {
+        scanString();
+        continue;
+      }
+      if (stopAtBrace && (c === '{' || c === '}')) {
+        if (c === '}' && depth === 0) return;
+        depth += c === '{' ? 1 : -1;
+        out.push(' ');
+        i++;
+        continue;
+      }
+      out.push(c);
+      i++;
+    }
+  }
+
+  scanCode(false);
+  return out.join('');
+}
+
+const CS_TOKEN_RE = /@?[\p{L}_][\p{L}\p{Nd}_]*|::|[{};=(),.<>]/gu;
+const CS_IDENT_RE = /^@?[\p{L}_]/u;
+const CS_TYPE_KEYWORDS = new Set(['class', 'interface', 'struct', 'enum', 'record']);
+// Tokens that may follow a type keyword without it being a declaration
+// (generic constraints such as `where T : class, new()` / `where U : struct`).
+const CS_NOT_A_TYPE_NAME = new Set(['where', 'new', 'class', 'struct']);
+
+/**
+ * Parse one C# source into the facts the namespace resolver needs:
+ *   namespaces — namespaces declared in the file (full dotted names)
+ *   types      — [{ ns, name }] top-level type declarations
+ *   usings     — [{ target, alias, isStatic, isGlobal, scope }]
+ *   idents     — identifiers referenced outside using/namespace directives
+ *   chains     — dotted identifier chains (`A.B.C`), for qualified references
+ */
+export function parseCSharpSource(src) {
+  const code = stripCSharpNoise(src);
+  const toks = code.match(CS_TOKEN_RE) ?? [];
+  const isIdent = t => t !== undefined && CS_IDENT_RE.test(t);
+  const bare = t => (t[0] === '@' ? t.slice(1) : t);
+
+  const namespaces = new Set();
+  const types = [];
+  const usings = [];
+  const idents = new Set();
+  const chains = new Set();
+
+  const stack = []; // { kind: 'ns', name } | { kind: 'other' }
+  let otherDepth = 0;
+  let fileNs = '';
+  let pendingNs = null;
+  let chain = [];
+
+  const currentNs = () => {
+    for (let k = stack.length - 1; k >= 0; k--) {
+      if (stack[k].kind === 'ns') return stack[k].name;
+    }
+    return fileNs;
+  };
+  const flushChain = () => {
+    if (chain.length >= 2) chains.add(chain.join('.'));
+    chain = [];
+  };
+  // Read `Ident(.Ident)*` starting at toks[t]; returns [name, nextIndex].
+  const readQualified = t => {
+    if (toks[t] === 'global' && toks[t + 1] === '::') t += 2;
+    const parts = [];
+    while (isIdent(toks[t])) {
+      parts.push(bare(toks[t]));
+      if (toks[t + 1] !== '.') { t++; break; }
+      t += 2;
+    }
+    return [parts.join('.'), t];
+  };
+
+  for (let t = 0; t < toks.length; t++) {
+    const tok = toks[t];
+
+    if (tok === '{') {
+      flushChain();
+      if (pendingNs !== null) {
+        stack.push({ kind: 'ns', name: pendingNs });
+        pendingNs = null;
+      } else {
+        stack.push({ kind: 'other' });
+        otherDepth++;
+      }
+      continue;
+    }
+    if (tok === '}') {
+      flushChain();
+      const top = stack.pop();
+      if (top && top.kind === 'other') otherDepth--;
+      continue;
+    }
+
+    if (otherDepth === 0) {
+      if (tok === 'namespace') {
+        flushChain();
+        const [name, next] = readQualified(t + 1);
+        if (name) {
+          const outer = currentNs();
+          const full = outer ? `${outer}.${name}` : name;
+          namespaces.add(full);
+          if (toks[next] === ';') fileNs = full;
+          else pendingNs = full;
+        }
+        t = next - 1; // let the `{` / `;` be processed normally
+        continue;
+      }
+      if (tok === 'using' || (tok === 'global' && toks[t + 1] === 'using')) {
+        flushChain();
+        let u = tok === 'global' ? t + 2 : t + 1;
+        const isGlobal = tok === 'global';
+        let isStatic = false;
+        let alias = null;
+        if (toks[u] === 'static') { isStatic = true; u++; }
+        if (isIdent(toks[u]) && toks[u + 1] === '=') { alias = bare(toks[u]); u += 2; }
+        const [target, next] = readQualified(u);
+        let end = next;
+        while (end < toks.length && toks[end] !== ';' && toks[end] !== '{' && toks[end] !== '}') end++;
+        if (target && toks[end] === ';') {
+          usings.push({ target, alias, isStatic, isGlobal, scope: currentNs() });
+          t = end;
+          continue;
+        }
+        // Not a directive (e.g. `using (...)`): fall through as plain tokens.
+      }
+      if (CS_TYPE_KEYWORDS.has(tok)) {
+        let nameAt = t + 1;
+        if (tok === 'record' && (toks[nameAt] === 'class' || toks[nameAt] === 'struct')) nameAt++;
+        const name = toks[nameAt];
+        if (isIdent(name) && !CS_NOT_A_TYPE_NAME.has(name)) {
+          types.push({ ns: currentNs(), name: bare(name) });
+          flushChain();
+          t = nameAt; // the declared name is not a reference
+          continue;
+        }
+      }
+      if (tok === 'delegate') {
+        // `delegate Ret<Generic> Name<T>(...)`: the name is the last
+        // identifier at angle depth 0 before `(`; anonymous `delegate (...)`
+        // has fewer than two and is skipped.
+        let angle = 0;
+        let last = null;
+        let count = 0;
+        let k = t + 1;
+        for (; k < toks.length && toks[k] !== '(' && toks[k] !== ';' && toks[k] !== '{'; k++) {
+          if (toks[k] === '<') angle++;
+          else if (toks[k] === '>') angle--;
+          else if (angle === 0 && isIdent(toks[k])) { last = bare(toks[k]); count++; }
+        }
+        if (toks[k] === '(' && count >= 2) types.push({ ns: currentNs(), name: last });
+      }
+    }
+
+    if (isIdent(tok)) {
+      const name = bare(tok);
+      idents.add(name);
+      if (chain.length > 0 && toks[t - 1] === '.') chain.push(name);
+      else { flushChain(); chain.push(name); }
+    } else if (tok !== '.') {
+      flushChain();
+    }
+  }
+  flushChain();
+
+  return { namespaces, types, usings, idents, chains };
+}
+
+/**
+ * Read and index every .cs file of the inventory once. The index is shared by
+ * all per-file resolutions (O(files) build, O(identifiers x visible
+ * namespaces) per file).
+ */
+async function buildCSharpIndex(projectRoot, files) {
+  const csPaths = [];
+  const projectDirs = [];
+  for (const f of files) {
+    const p = toPosix(f.path);
+    if (p.endsWith('.csproj')) projectDirs.push(dirOf(p));
+    else if (p.endsWith('.cs') && !isGeneratedCSharpPath(p)) csPaths.push(p);
+  }
+  // Longest first so the nearest ancestor .csproj wins.
+  projectDirs.sort((a, b) => b.length - a.length || comparePaths(a, b));
+  const projectOf = p => {
+    for (const d of projectDirs) {
+      if (d === '' || p.startsWith(`${d}/`)) return d;
+    }
+    return '';
+  };
+
+  const reads = await readFilesParallel(
+    csPaths.map(p => ({ key: p, absPath: join(projectRoot, p) })),
+  );
+
+  const parsed = new Map();
+  const typesByNs = new Map();
+  const globalUsingsByProject = new Map();
+  for (const { key, raw } of reads) {
+    if (raw === null) continue; // the per-file loop reports read failures
+    let info;
+    try {
+      info = parseCSharpSource(raw);
+    } catch {
+      continue;
+    }
+    parsed.set(key, info);
+    for (const { ns, name } of info.types) {
+      if (!typesByNs.has(ns)) typesByNs.set(ns, new Map());
+      const byName = typesByNs.get(ns);
+      if (!byName.has(name)) byName.set(name, []);
+      const arr = byName.get(name);
+      if (!arr.includes(key)) arr.push(key);
+    }
+    const globals = info.usings.filter(u => u.isGlobal);
+    if (globals.length > 0) {
+      const proj = projectOf(key);
+      if (!globalUsingsByProject.has(proj)) globalUsingsByProject.set(proj, []);
+      globalUsingsByProject.get(proj).push(...globals);
+    }
+  }
+
+  return { parsed, typesByNs, globalUsingsByProject, projectOf };
+}
+
+/** Yield `ns` and every enclosing namespace (`A.B.C`, `A.B`, `A`). */
+function csNamespaceChain(ns) {
+  const out = [];
+  let cur = ns;
+  while (cur) {
+    out.push(cur);
+    const k = cur.lastIndexOf('.');
+    cur = k < 0 ? '' : cur.slice(0, k);
+  }
+  return out;
+}
+
+/**
+ * Resolve one C# file to the project files declaring the types it references.
+ * `content` is used only when the file is missing from the prebuilt index.
+ */
+export function resolveCSharpFile(path, content, idx) {
+  if (isGeneratedCSharpPath(path)) return [];
+  const info = idx.parsed.get(path) ?? parseCSharpSource(content);
+  const out = new Set();
+
+  const addType = (ns, name) => {
+    const hits = idx.typesByNs.get(ns)?.get(name);
+    if (!hits) return false;
+    for (const f of hits) out.add(f);
+    return true;
+  };
+  const addFqnType = fqn => {
+    const k = fqn.lastIndexOf('.');
+    return addType(k < 0 ? '' : fqn.slice(0, k), k < 0 ? fqn : fqn.slice(k + 1));
+  };
+
+  // Global namespace + own namespaces with all of their parents.
+  const visible = new Set(['']);
+  for (const ns of info.namespaces) {
+    for (const p of csNamespaceChain(ns)) visible.add(p);
+  }
+
+  const usings = [
+    ...info.usings,
+    ...(idx.globalUsingsByProject.get(idx.projectOf(path)) ?? []),
+  ];
+  for (const u of usings) {
+    if (u.alias !== null && !info.idents.has(u.alias)) continue;
+    // A using inside `namespace N { ... }` may be relative to N or its parents.
+    const candidates = [u.target, ...csNamespaceChain(u.scope).map(s => `${s}.${u.target}`)];
+    for (const target of candidates) {
+      if (u.isStatic) {
+        if (addFqnType(target)) break;
+      } else if (idx.typesByNs.has(target)) {
+        visible.add(target);
+        break;
+      } else if (addFqnType(target)) {
+        // `using X.Y.Type;` / `using A = X.Y.Type;` naming a type directly.
+        break;
+      }
+    }
+  }
+
+  for (const id of info.idents) {
+    for (const ns of visible) addType(ns, id);
+  }
+  for (const chain of info.chains) {
+    const segs = chain.split('.');
+    for (let k = 1; k < segs.length; k++) {
+      addType(segs.slice(0, k).join('.'), segs[k]);
+    }
+  }
+
+  out.delete(path);
+  return [...out].sort(comparePaths);
 }
 
 // ---------------------------------------------------------------------------
@@ -1912,9 +2349,6 @@ function resolveImport(imp, file, ctx) {
   if (lang === 'scala') {
     return resolveScalaImport(src, imp.specifiers, file, ctx);
   }
-  if (lang === 'csharp') {
-    return resolveCSharpImport(src, file, ctx);
-  }
   if (lang === 'swift') {
     return resolveSwiftImport(src, file, ctx);
   }
@@ -2022,6 +2456,15 @@ async function main() {
   const ctx = await buildResolutionContext(projectRoot, files);
   failures.push(...ctx.failures);
 
+  // C# resolves through a solution-wide namespace index built from the FULL
+  // inventory (a narrowed analysisPaths still needs every declaring file).
+  if (
+    treeSitterReady &&
+    analysisFiles.some(f => f.fileCategory === 'code' && f.language === 'csharp')
+  ) {
+    ctx.csharpIndex = await buildCSharpIndex(projectRoot, files);
+  }
+
   const importMap = {};
   let filesWithImports = 0;
   let totalEdges = 0;
@@ -2064,11 +2507,16 @@ async function main() {
     try {
       const resolvedSet = new Set();
 
+      // C# resolves against the namespace index (see resolveCSharpFile).
       // Ruby is the only language whose tree-sitter import field doesn't
       // preserve the require vs require_relative discriminator, so the
       // resolver needs the regex-parsed shape directly. All other tree-sitter
       // languages get analyzed once and dispatched normally.
-      if (file.language === 'ruby') {
+      if (file.language === 'csharp') {
+        for (const out of resolveCSharpFile(path, content, ctx.csharpIndex)) {
+          if (ctx.fileSet.has(out)) resolvedSet.add(out);
+        }
+      } else if (file.language === 'ruby') {
         for (const imp of parseRubyImports(content)) {
           for (const out of resolveRubyImport(imp, file, ctx)) {
             if (out && ctx.fileSet.has(out)) resolvedSet.add(out);
