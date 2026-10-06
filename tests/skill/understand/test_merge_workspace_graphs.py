@@ -772,6 +772,41 @@ class TestManifestBindingsAndEnv(_WorkspaceCase):
                 self.assertNotEqual(res.returncode, 0, res.stdout)
                 self.assertIn(needle, res.stderr)
 
+    def test_origin_keyed_bindings_are_accepted(self) -> None:
+        res = self._with(bindings={
+            "https://storage.googleapis.com": "external:gcs",
+            "storage.googleapis.com": "external:gcs",  # same origin, same target: fine
+            "https://cloudkms.googleapis.com/": "external:kms",
+            "api.local:8082": "a:/api",
+            "http://localhost:9000": "b",
+            "spring.datasource.url": "b",  # dotted env/property name stays a plain key
+        })
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_invalid_origin_keyed_bindings(self) -> None:
+        cases = [
+            ({"https://storage.googleapis.com/bucket": "external:gcs"}, "must be an origin"),
+            ({"https://storage.googleapis.com?x=1": "external:gcs"}, "must be an origin"),
+            ({"https://user@host.com": "external:x"}, "must be an origin"),
+            ({"https://storage.googleapis.com": "external:gcs",
+              "storage.googleapis.com:443": "external:other"}, "same origin"),
+            ({"api.local:8082": "ghost"}, "ghost"),
+        ]
+        for bindings, needle in cases:
+            with self.subTest(bindings=bindings):
+                res = self._with(bindings=bindings)
+                self.assertNotEqual(res.returncode, 0, res.stdout)
+                self.assertIn(needle, res.stderr)
+
+    def test_binding_origin_parsing(self) -> None:
+        origin = mwg.binding_origin
+        self.assertEqual(origin("https://Storage.GoogleApis.com"), ("storage.googleapis.com", None))
+        self.assertEqual(origin("http://storage.googleapis.com:443/"), ("storage.googleapis.com", None))
+        self.assertEqual(origin("storage.googleapis.com"), ("storage.googleapis.com", None))
+        self.assertEqual(origin("localhost:8082"), ("localhost", 8082))
+        self.assertIsNone(origin("REACT_APP_API_GESTAO"))
+        self.assertIsNone(origin("https://host.com/path"))
+
     def test_invalid_env(self) -> None:
         cases = [
             (["x"], "env"),

@@ -521,6 +521,170 @@ class TestTableKeys(unittest.TestCase):
         self.assertEqual(lc.clean_table('"public"."users"'), "public.users")
 
 
+# ── In-memory linking: origin bindings, base transforms, nearest routes ──
+
+BACK_CTRL = "src/routes.py"
+FRONT_GCS = "src/storage.js"
+FRONT_CALLS = "src/calls.js"
+
+
+def _mem_graph(files: dict[str, list[str]]) -> dict[str, Any]:
+    nodes = [_file_node(f"{m}/{f}") for m, fs in files.items() for f in fs]
+    return {"project": {"workspace": {}}, "nodes": nodes, "edges": [],
+            "layers": [{"id": "layer:all", "name": "All", "description": "all",
+                        "nodeIds": [n["id"] for n in nodes]}], "tour": []}
+
+
+def _back_contracts() -> dict[str, Any]:
+    return _contracts(
+        providers=[_prov("GET", "/api/x", BACK_CTRL, 1, framework="flask"),
+                   _prov("GET", "/x", BACK_CTRL, 2, framework="flask"),
+                   _prov("GET", "/health", BACK_CTRL, 3, framework="flask"),
+                   _prov("GET", "/api/Operacoes/elegiveis", BACK_CTRL, 4, framework="flask"),
+                   _prov("GET", "/api/Operacoes/{}", BACK_CTRL, 5, framework="flask"),
+                   _prov("POST", "/api/Obras", BACK_CTRL, 6, framework="flask")],
+        services=[{"name": "back-svc", "ports": ["8080:8080"], "hostnames": []}],
+    )
+
+
+def _run_link(front: dict[str, Any], bindings: dict[str, str] | None = None) -> dict[str, Any]:
+    graph = _mem_graph({"front": [FRONT_GCS, FRONT_CALLS], "back": [BACK_CTRL]})
+    return lc.link(graph, ["front", "back"], {"front": front, "back": _back_contracts()},
+                   bindings or {}, {}, [])
+
+
+def _by_line(report: dict[str, Any]) -> dict[int, tuple[str, dict[str, Any]]]:
+    out: dict[int, tuple[str, dict[str, Any]]] = {}
+    cons = report["consumers"]
+    for kind in ("linked", "unresolved", "unmatched"):
+        for row in cons[kind]:
+            out[row["line"]] = (kind, row)
+    return out
+
+
+class TestOriginBindings(unittest.TestCase):
+    BINDINGS = {
+        "https://storage.googleapis.com": "external:gcs",
+        "cloudkms.googleapis.com": "external:kms",
+        "back.example.com:8082": "back",
+        "http://legacy.example.com": "back:/api",
+        "BACK_NAME": "back",
+    }
+
+    def test_literal_bases_bound_by_origin(self) -> None:
+        def lit(path: str, line: int, value: str) -> dict[str, Any]:
+            return _cons("GET", path, FRONT_GCS, line, base_type="literal", base_value=value)
+
+        front = _contracts(consumers=[
+            lit("/b/x/o", 1, "https://storage.googleapis.com"),
+            lit("/v1/keys", 2, "http://STORAGE.googleapis.com:443/storage"),     # scheme/case/default port
+            lit("/v1/keys", 3, "https://cloudkms.googleapis.com"),                 # bare-host key
+            lit("/x", 4, "http://back.example.com:8082/api"),                      # host:port key, path kept
+            lit("/x", 5, "http://back.example.com:9000/api"),                      # other port: not bound
+            lit("/x", 6, "https://legacy.example.com/ignored"),                    # binding prefix wins
+            _cons("GET", "/health", FRONT_GCS, 7, base_name="BACK_NAME"),          # env-name key unchanged
+        ])
+        rows = _by_line(_run_link(front, self.BINDINGS))
+        self.assertEqual(rows[1][0], "unresolved")
+        self.assertEqual((rows[1][1]["reason"], rows[1][1]["target"]), ("external", "external:gcs"))
+        self.assertEqual(rows[2][1]["target"], "external:gcs")
+        self.assertEqual(rows[3][1]["target"], "external:kms")
+        self.assertEqual(rows[4][0], "linked")
+        self.assertEqual((rows[4][1]["path"], rows[4][1]["resolution"]), ("/api/x", "binding"))
+        self.assertEqual(rows[4][1]["confidence"], 0.9)  # consumer 0.9 × literal 1.0 × binding 1.0
+        self.assertEqual(rows[5][0], "unresolved")
+        self.assertEqual(rows[5][1]["reason"], "no-binding")
+        self.assertIn("back.example.com:9000", rows[5][1]["detail"])
+        self.assertEqual((rows[6][0], rows[6][1]["path"]), ("linked", "/api/x"))
+        self.assertEqual((rows[7][0], rows[7][1]["path"]), ("linked", "/health"))
+
+    def test_portless_key_covers_any_port_when_no_exact_key(self) -> None:
+        front = _contracts(consumers=[
+            _cons("GET", "/x", FRONT_GCS, 1, base_type="literal", base_value="http://back.example.com:9000/api")])
+        rows = _by_line(_run_link(front, {"back.example.com": "back"}))
+        self.assertEqual((rows[1][0], rows[1][1]["path"]), ("linked", "/api/x"))
+
+    def test_origin_binding_applies_to_env_values_too(self) -> None:
+        front = _contracts(
+            consumers=[_cons("PUT", "/b/o", FRONT_GCS, 1, base_name="GCS_URL")],
+            env=[_env("GCS_URL", "https://storage.googleapis.com/upload")])
+        rows = _by_line(_run_link(front, {"storage.googleapis.com": "external:gcs"}))
+        self.assertEqual(rows[1][1]["target"], "external:gcs")
+
+
+class TestBaseTransforms(unittest.TestCase):
+    def test_apply_transform(self) -> None:
+        self.assertEqual(lc.apply_transform("/api", {"stripSuffix": "/api"}), ("/", 1.0))
+        self.assertEqual(lc.apply_transform("/v1/API/", {"stripSuffix": "api"}), ("/v1", 1.0))
+        self.assertEqual(lc.apply_transform("/v1/api", {"stripSuffix": "/zzz"}), ("/v1/api", 1.0))
+        self.assertEqual(lc.apply_transform("/myapi", {"stripSuffix": "/api"}), ("/myapi", 1.0))
+        self.assertEqual(lc.apply_transform("/api/v1", {"origin": True}), ("/", 1.0))
+        self.assertEqual(lc.apply_transform("/api", {"unknown": True}), ("/api", 0.8))
+        self.assertEqual(lc.apply_transform("/api", None), ("/api", 1.0))
+
+    def test_transforms_in_path_join(self) -> None:
+        def call(path: str, line: int, env_name: str, transform: dict[str, Any] | None,
+                 suffix: str = "") -> dict[str, Any]:
+            c = _cons("GET", path, FRONT_CALLS, line, base_name=env_name, suffix=suffix)
+            if transform is not None:
+                c["base"]["transform"] = transform
+            return c
+
+        front = _contracts(
+            consumers=[
+                call("/x", 1, "BACK_API", {"stripSuffix": "/api"}),        # /api + /x → /x
+                call("/health", 2, "BACK_V1", {"origin": True}),           # /api/v1 dropped → /health
+                call("/x", 3, "BACK_API", {"unknown": True}),              # kept → /api/x, × 0.8
+                call("/x", 4, "BACK_API", None),                           # no transform → /api/x
+                call("/x", 5, "BACK_V1", {"stripSuffix": "/api/v1"}, suffix="/api"),  # base.suffix kept → /api/x
+                call("/x", 6, "BACK_BOUND", {"stripSuffix": "/api"}),      # applies to the binding prefix
+            ],
+            env=[_env("BACK_API", "http://back-svc:8080/api"),
+                 _env("BACK_V1", "http://back-svc:8080/api/v1")])
+        report = _run_link(front, {"BACK_BOUND": "back:/api"})
+        rows = _by_line(report)
+        self.assertEqual({ln: rows[ln][0] for ln in rows}, {ln: "linked" for ln in range(1, 7)})
+        self.assertEqual(rows[1][1]["path"], "/x")
+        self.assertEqual(rows[2][1]["path"], "/health")
+        self.assertEqual(rows[3][1]["path"], "/api/x")
+        self.assertEqual(rows[3][1]["confidence"], 0.648)  # 0.9 × literal route 1.0 × env 0.9 × 0.8
+        self.assertEqual(rows[4][1]["confidence"], 0.81)
+        self.assertNotIn("transform", rows[4][1])
+        self.assertEqual(rows[5][1]["path"], "/api/x")
+        self.assertEqual(rows[6][1]["path"], "/x")
+        self.assertEqual(rows[1][1]["transform"], {"stripSuffix": "/api"})
+
+
+class TestNearestRoutes(unittest.TestCase):
+    def test_unmatched_consumers_get_three_nearest_routes(self) -> None:
+        front = _contracts(
+            consumers=[_cons("GET", "/Operacao/elegiveis", FRONT_CALLS, 1, base_name="BACK_API"),
+                       _cons("GET", "/Obras", FRONT_CALLS, 2, base_name="BACK_API"),
+                       _cons("GET", None, FRONT_CALLS, 3, base_name="BACK_API")],
+            env=[_env("BACK_API", "http://back-svc:8080/api")])
+        rows = _by_line(_run_link(front))
+        kind, row = rows[1]
+        self.assertEqual((kind, row["reason"]), ("unmatched", "no-route"))
+        self.assertEqual(len(row["nearest"]), 3)
+        self.assertEqual(row["nearest"][0], {"method": "GET", "route": "/api/Operacoes/elegiveis",
+                                             "file": f"back/{BACK_CTRL}"})
+        self.assertEqual(row["nearest"][1]["route"], "/api/Operacoes/{}")
+        # method mismatch also lists the route that exists with another method
+        kind, row = rows[2]
+        self.assertEqual(row["reason"], "method-mismatch")
+        self.assertEqual(row["nearest"][0], {"method": "POST", "route": "/api/Obras", "file": f"back/{BACK_CTRL}"})
+        self.assertEqual(rows[3][1]["nearest"], [])  # path unknown: nothing to compare
+
+    def test_nearest_is_deterministic_and_limited(self) -> None:
+        provs = _back_contracts()["providers"]
+        first = lc.nearest_routes("/api/y", provs, "back")
+        self.assertEqual(first, lc.nearest_routes("/api/y", provs, "back"))
+        self.assertEqual([n["route"] for n in first][0], "/api/x")
+        self.assertEqual(lc.nearest_routes("/api/y", provs[:2], "back", limit=3),
+                         [{"method": "GET", "route": "/api/x", "file": f"back/{BACK_CTRL}"},
+                          {"method": "GET", "route": "/x", "file": f"back/{BACK_CTRL}"}])
+
+
 # ── End-to-end through merge-workspace-graphs.py ──────────────────────────
 
 class TestLinkEndToEnd(_Workspace):
@@ -718,6 +882,11 @@ class TestLinkEndToEnd(_Workspace):
         mm = next(u for u in cons["unmatched"] if u["reason"] == "method-mismatch")
         self.assertEqual(mm["target"], "excel")
         self.assertEqual(mm["path"], "/Comisoes/Gerar")
+        self.assertEqual(mm["nearest"], [{"method": "POST", "route": "/Comisoes/Gerar", "file": f"excel/{EXCEL_CTRL}"}])
+        obras = next(u for u in cons["unmatched"] if u["file"] == f"front/{FRONT_OBRAS}")
+        self.assertEqual(len(obras["nearest"]), 3)
+        self.assertTrue(all(set(n) == {"method", "route", "file"} and n["file"].startswith("gestao/")
+                            for n in obras["nearest"]))
 
         dead = {(p["member"], p["method"], p["route"]) for p in r["providersWithoutConsumers"]}
         self.assertEqual(dead, {("gestao", "GET", "/api/Nunca/chamado"),

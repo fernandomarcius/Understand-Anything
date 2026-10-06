@@ -22,8 +22,9 @@ After the merge it links cross-service contracts in memory (link-contracts.py:
 HTTP calls, message channels, shared tables) unless `--no-contracts` is given,
 then validates the final graph with the plugin's inline-validator rules
 (`validate_workspace_graph`) before anything is written. The manifest may carry
-optional `bindings` ({ ENV: "member[:/prefix]" | "external:<label>" }) and `env`
-({ ENV: "url" }) maps for that linker.
+optional `bindings` ({ ENV | origin: "member[:/prefix]" | "external:<label>" }, where an
+origin key — `https://host[:port]` or a bare `host[:port]` — binds literal bases by host) and
+`env` ({ ENV: "url" }) maps for that linker.
 
 Output:
     <ua-dir>/knowledge-graph.json   merged workspace graph
@@ -145,16 +146,58 @@ def parse_binding(value: str) -> tuple[str, str, str]:
     return "member", target, prefix if sep else ""
 
 
+_ORIGIN_URL_KEY_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9+.-]*://(?P<host>[A-Za-z0-9._-]+)(?::(?P<port>\d+))?/?$")
+_ORIGIN_HOST_KEY_RE = re.compile(r"^(?P<host>[A-Za-z0-9._-]+)(?::(?P<port>\d+))?$")
+DEFAULT_PORTS = {80, 443}
+
+
+def binding_origin(key: Any) -> tuple[str, int | None] | None:
+    """Binding key → (host lowercased, port|None) when it names an origin, else None.
+
+    Origin keys are `scheme://host[:port][/]` (scheme ignored) or a bare `host[:port]`
+    whose host has a dot or that carries a port (`storage.googleapis.com`,
+    `localhost:8082`). Ports 80/443 count as "no port", so http/https keys and
+    bases compare scheme-insensitively. Other keys are env names.
+    """
+    if not isinstance(key, str):
+        return None
+    m = _ORIGIN_URL_KEY_RE.match(key) if "://" in key else _ORIGIN_HOST_KEY_RE.match(key)
+    if not m:
+        return None
+    host, port = m.group("host").lower(), m.group("port")
+    if "://" not in key and not port and "." not in host:
+        return None
+    p = int(port) if port else None
+    return host, None if p in DEFAULT_PORTS else p
+
+
 def validate_bindings(bindings: Any, member_names: set[str]) -> None:
-    """Optional `{ ENV_NAME: "member[:/prefix]" | "external:<label>" }`; member must exist."""
+    """Optional `{ ENV_NAME | origin: "member[:/prefix]" | "external:<label>" }`; member must exist.
+
+    An origin key (`https://host[:port]` or bare `host[:port]`) binds literal bases by
+    host; a key with `://` must be exactly an origin, and two keys naming the same
+    origin must agree.
+    """
     if bindings is None:
         return
     if not isinstance(bindings, dict):
         raise WorkspaceError(f"{MANIFEST_NAME}: field 'bindings' must be an object")
+    origins: dict[tuple[str, int | None], str] = {}
     for key, value in bindings.items():
         if not key:
             raise WorkspaceError(f"{MANIFEST_NAME}: field 'bindings' has an empty variable name")
         field = f"bindings.{key}"
+        origin = binding_origin(key)
+        if "://" in key and origin is None:
+            raise WorkspaceError(
+                f"{MANIFEST_NAME}: {field} URL key must be an origin like \"https://host[:port]\" "
+                "(no path, query or credentials)")
+        if origin is not None and isinstance(value, str):
+            other = origins.setdefault(origin, key)
+            if other != key and bindings[other] != value:
+                raise WorkspaceError(
+                    f"{MANIFEST_NAME}: {field} and bindings.{other} name the same origin with different targets")
         if not isinstance(value, str) or not value:
             raise WorkspaceError(
                 f"{MANIFEST_NAME}: {field} must be \"member[:/prefix]\" or \"external:<label>\" (got {value!r})")

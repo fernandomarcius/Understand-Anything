@@ -38,6 +38,7 @@ Stdlib only; no LLM involved. Usually run in memory by merge-workspace-graphs.py
 
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import importlib.util
 import json
@@ -62,6 +63,8 @@ SUPPORTED_VERSION = 1
 MATCH_FACTOR = {0: 1.0, 1: 0.9, 2: 0.5}  # literal, templated, catch-all
 RESOLUTION_FACTOR = {"binding": 1.0, "manifest-env": 1.0, "env": 0.9, "literal": 0.9}
 ANY_METHODS = {"", "ANY", "*"}
+UNKNOWN_TRANSFORM_FACTOR = 0.8  # consumer.base.transform = {"unknown": true}
+NEAREST_LIMIT = 3  # provider routes suggested for each unmatched consumer
 
 
 def _load_merge_module() -> Any:
@@ -84,6 +87,7 @@ _mwg = _load_merge_module()
 WorkspaceError = _mwg.WorkspaceError
 FILE_LEVEL_TYPES = _mwg.FILE_LEVEL_TYPES
 parse_binding = _mwg.parse_binding
+binding_origin = _mwg.binding_origin
 
 
 # ── Route normalization (docs: "Route normalization") ───────────────────────
@@ -180,6 +184,33 @@ def published_port(spec: Any) -> int | None:
     return int(candidate) if candidate.isdigit() else None
 
 
+def origin_bindings(bindings: dict[str, Any]) -> dict[tuple[str, int | None], str]:
+    """Manifest binding keys that name an origin (`https://host[:port]`, `host[:port]`) → value."""
+    out: dict[tuple[str, int | None], str] = {}
+    for key in sorted(bindings):
+        origin = binding_origin(key)
+        if origin is not None and isinstance(bindings[key], str):
+            out.setdefault(origin, bindings[key])
+    return out
+
+
+def lookup_origin_binding(by_origin: dict[tuple[str, int | None], str], host: str,
+                          port: int | None) -> str | None:
+    """Binding for a base URL's host/port: exact origin first, then a portless key for that host."""
+    p = None if port in _mwg.DEFAULT_PORTS else port
+    hit = by_origin.get((host, p))
+    if hit is None and p is not None:
+        hit = by_origin.get((host, None))
+    return hit
+
+
+def _binding_result(value: str, base_path: str) -> dict[str, Any]:
+    kind, target, prefix = parse_binding(value)
+    if kind == "external":
+        return {"status": "external", "target": f"external:{target}", "resolution": "binding"}
+    return {"status": "member", "member": target, "basePath": prefix or base_path, "resolution": "binding"}
+
+
 class _ServiceIndex:
     def __init__(self, contracts_by_member: dict[str, dict[str, Any]]):
         self.by_host: dict[str, set[str]] = {}
@@ -211,14 +242,15 @@ class _ServiceIndex:
 
 
 def resolve_target(consumer: dict[str, Any], member: str, ctx: dict[str, Any]) -> dict[str, Any]:
-    """Resolve a consumer's target member: binding → manifest env → member env → base literal."""
+    """Resolve a consumer's target member: binding → manifest env → member env → base literal.
+
+    Each candidate value is checked against origin-keyed bindings (by host/port) before
+    the members' `services`.
+    """
     base = consumer.get("base") if isinstance(consumer.get("base"), dict) else {}
     name = base.get("name") if isinstance(base.get("name"), str) else None
     if name and name in ctx["bindings"]:
-        kind, target, prefix = parse_binding(ctx["bindings"][name])
-        if kind == "external":
-            return {"status": "external", "target": f"external:{target}", "resolution": "binding"}
-        return {"status": "member", "member": target, "basePath": prefix or "/", "resolution": "binding"}
+        return _binding_result(ctx["bindings"][name], "/")
 
     candidates: list[tuple[str, str]] = []
     if name and name in ctx["env"]:
@@ -240,6 +272,10 @@ def resolve_target(consumer: dict[str, Any], member: str, ctx: dict[str, Any]) -
         if url is None:
             details.append(f"value {value!r} is not a URL")
             continue
+        bound = lookup_origin_binding(ctx["originBindings"], url[0], url[1])
+        if bound is not None:
+            # An origin binding has no prefix of its own unless it says so: keep the value's path.
+            return _binding_result(bound, url[2])
         target, detail = ctx["services"].lookup(url[0], url[1])
         if target:
             return {"status": "member", "member": target, "basePath": url[2], "resolution": resolution}
@@ -316,6 +352,50 @@ def match_provider(method: Any, path: Any, providers: list[dict[str, Any]]) -> t
 
 def match_class(provider: dict[str, Any]) -> int:
     return _route_shape(provider)[2]
+
+
+def apply_transform(base_path: str, transform: Any) -> tuple[str, float]:
+    """Apply `consumer.base.transform` to the resolved base path → (path, confidence factor).
+
+    `{"origin": true}` drops the path, `{"stripSuffix": "/api"}` removes that trailing
+    path (case-insensitive, segment-aligned; no-op when absent), `{"unknown": true}`
+    keeps the path and returns factor 0.8. Anything else is a no-op.
+    """
+    if not isinstance(transform, dict):
+        return base_path, 1.0
+    path = normalize_route(base_path)
+    if transform.get("origin") is True:
+        path = "/"
+    elif isinstance(transform.get("stripSuffix"), str):
+        segs = [s for s in path.split("/") if s]
+        cut = _segments(normalize_route(transform["stripSuffix"]))
+        if cut and [s.lower() for s in segs[-len(cut):]] == cut:
+            path = join_paths(*segs[:-len(cut)])
+    factor = UNKNOWN_TRANSFORM_FACTOR if transform.get("unknown") is True else 1.0
+    return path, factor
+
+
+def nearest_routes(path: Any, providers: list[dict[str, Any]], target: str,
+                   limit: int = NEAREST_LIMIT) -> list[dict[str, Any]]:
+    """The `limit` provider routes closest to `path`.
+
+    Ranked by character similarity of the normalized, lowercased paths, then by
+    segment similarity, then file order — deterministic for the same inputs.
+    """
+    if not isinstance(path, str):
+        return []
+    want = normalize_route(path).lower()
+    want_segs = _segments(want)
+    scored: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    for idx, prov in enumerate(providers):
+        route = normalize_route(prov.get("route")).lower()
+        seg_ratio = difflib.SequenceMatcher(None, want_segs, _segments(route), autojunk=False).ratio()
+        str_ratio = difflib.SequenceMatcher(None, want, route, autojunk=False).ratio()
+        key = (-round(str_ratio, 6), -round(seg_ratio, 6), str(prov.get("file", "")), _int(prov.get("line")), idx)
+        scored.append((key, prov))
+    scored.sort(key=lambda kv: kv[0])
+    return [{"method": _method_label(p.get("method")), "route": p.get("route"), "file": f"{target}/{p.get('file')}"}
+            for _k, p in scored[:limit]]
 
 
 # ── Messages / tables helpers ───────────────────────────────────────────────
@@ -416,7 +496,8 @@ def link(graph: dict[str, Any], members: list[str], contracts: dict[str, dict[st
                       and e.get("source") in kept_ids and e.get("target") in kept_ids]
     _strip_contracts_layer(graph, removed_ids)
     em = _Emitter(graph, warnings)
-    ctx = {"bindings": bindings, "env": env, "contracts": contracts, "services": _ServiceIndex(contracts)}
+    ctx = {"bindings": bindings, "originBindings": origin_bindings(bindings), "env": env,
+           "contracts": contracts, "services": _ServiceIndex(contracts)}
 
     # ── HTTP ────────────────────────────────────────────────────────────────
     linked: list[dict[str, Any]] = []
@@ -444,25 +525,32 @@ def link(graph: dict[str, Any], members: list[str], contracts: dict[str, dict[st
                 unresolved.append({**entry, "path": cons.get("path"), "reason": "no-binding", "detail": res["detail"]})
                 continue
             target = res["member"]
-            full = join_paths(res["basePath"], base.get("suffix"), cons["path"]) \
+            transform = base.get("transform") if isinstance(base.get("transform"), dict) and base["transform"] \
+                else None
+            base_path, transform_factor = apply_transform(res["basePath"], transform)
+            full = join_paths(base_path, base.get("suffix"), cons["path"]) \
                 if isinstance(cons.get("path"), str) else None
             entry.update({"path": full, "target": target, "resolution": res["resolution"]})
+            if transform is not None:
+                entry["transform"] = transform
             if target not in contracts:
                 unmatched.append({**entry, "reason": "no-route",
-                                  "detail": f"member '{target}' has no {CONTRACTS_NAME}"})
+                                  "detail": f"member '{target}' has no {CONTRACTS_NAME}", "nearest": []})
                 continue
             providers = [p for p in _list(contracts[target].get("providers")) if isinstance(p, dict)]
             prov, status = match_provider(cons.get("method"), full, providers)
             if prov is None:
                 detail = "consumer path unknown" if full is None else \
                     ("route exists with another method" if status == "method-mismatch" else "no matching route")
-                unmatched.append({**entry, "reason": status, "detail": detail})
+                unmatched.append({**entry, "reason": status, "detail": detail,
+                                  "nearest": nearest_routes(full, providers, target)})
                 continue
             used_providers.add((target, next(i for i, p in enumerate(providers) if p is prov)))
             cls = match_class(prov)
             conf = cons.get("confidence")
             conf = float(conf) if isinstance(conf, (int, float)) and not isinstance(conf, bool) and 0 < conf <= 1 else 1.0
-            confidence = round(conf * MATCH_FACTOR[cls] * RESOLUTION_FACTOR[res["resolution"]], 3)
+            confidence = round(conf * MATCH_FACTOR[cls] * RESOLUTION_FACTOR[res["resolution"]]
+                               * transform_factor, 3)
             ep = _endpoint_id(target, prov)
             method = _method_label(prov.get("method"))
             em.node({"id": ep, "type": "endpoint", "name": f"{method} {prov.get('route')}",
@@ -480,6 +568,8 @@ def link(graph: dict[str, Any], members: list[str], contracts: dict[str, dict[st
                         "provider": _loc(target, prov.get("file"), prov.get("line")),
                         "via": cons.get("via"), "base": entry["base"], "resolution": res["resolution"],
                         "path": full, "catchAll": cls == 2}
+            if transform is not None:
+                evidence["transform"] = transform
             e = em.edge(em.file_node(member, cons.get("file")), ep, "calls", confidence,
                         description=f"{cons.get('method') or 'HTTP'} {full} → {target}",
                         crossService=True, confidence=confidence, evidence=evidence, callSites=0)
