@@ -86,6 +86,10 @@ def _load_merge_module() -> Any:
 _mwg = _load_merge_module()
 WorkspaceError = _mwg.WorkspaceError
 FILE_LEVEL_TYPES = _mwg.FILE_LEVEL_TYPES
+# Node types that can anchor a file's contract edges when it has no `file:` node
+# (a .sql script analysed as `table:` nodes, a compose file as `service:`...), by preference.
+ANCHOR_TYPE_ORDER = ("file", "config", "service", "pipeline", "schema", "resource", "document",
+                     "table", "endpoint")
 parse_binding = _mwg.parse_binding
 binding_origin = _mwg.binding_origin
 
@@ -443,12 +447,15 @@ class _Emitter:
         self.warnings = warnings
         self.base_ids = {n.get("id") for n in graph["nodes"]}
         self.base_edges = {(e.get("source"), e.get("target"), e.get("type")) for e in graph["edges"]}
-        self.file_nodes: dict[str, str] = {}
-        for n in sorted(graph["nodes"], key=lambda n: (not str(n.get("id", "")).startswith("file:"),
-                                                       str(n.get("id", "")))):
-            fp = n.get("filePath")
-            if n.get("type") in FILE_LEVEL_TYPES and isinstance(fp, str) and fp:
-                self.file_nodes.setdefault(fp, n["id"])
+        # filePath → node type → sorted ids, for every node that can stand for a whole file.
+        self.path_nodes: dict[str, dict[str, list[str]]] = {}
+        for n in graph["nodes"]:
+            fp, ntype, nid = n.get("filePath"), n.get("type"), n.get("id")
+            if ntype in ANCHOR_TYPE_ORDER and isinstance(fp, str) and fp and isinstance(nid, str):
+                self.path_nodes.setdefault(fp, {}).setdefault(ntype, []).append(nid)
+        for by_type in self.path_nodes.values():
+            for ids in by_type.values():
+                ids.sort()
         self.nodes: dict[str, dict[str, Any]] = {}
         self.edges: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._missing_files: set[str] = set()
@@ -456,13 +463,26 @@ class _Emitter:
     def has(self, nid: str) -> bool:
         return nid in self.base_ids or nid in self.nodes
 
-    def file_node(self, member: str, file: Any) -> str | None:
+    def anchors(self, member: str, file: Any, *, all_tables: bool = False) -> list[str]:
+        """Nodes that stand for `member/file`: `file:<fp>`, else the file-level nodes
+        whose filePath is `<fp>` of the first type in ANCHOR_TYPE_ORDER (all `table:`
+        nodes when `all_tables`, otherwise the first by id); [] + one warning if none."""
         fp = f"{member}/{file}"
-        nid = self.file_nodes.get(fp)
-        if nid is None and fp not in self._missing_files:
+        if f"file:{fp}" in self.base_ids:
+            return [f"file:{fp}"]
+        by_type = self.path_nodes.get(fp, {})
+        for ntype in ANCHOR_TYPE_ORDER:
+            ids = by_type.get(ntype)
+            if ids:
+                return list(ids) if ntype == "table" and all_tables else ids[:1]
+        if fp not in self._missing_files:
             self._missing_files.add(fp)
             self.warnings.append(f"no file node for {fp} in the workspace graph; its contract edges are skipped")
-        return nid
+        return []
+
+    def file_node(self, member: str, file: Any) -> str | None:
+        found = self.anchors(member, file)
+        return found[0] if found else None
 
     def node(self, node: dict[str, Any]) -> None:
         if not self.has(node["id"]):
@@ -775,8 +795,9 @@ def _link_tables(em: _Emitter, members: list[str], contracts: dict[str, dict[str
             loc = _loc(member, x.get("file"), x.get("line"))
             (writers if kind == "writes" else readers).append(loc)
             etype = "writes_to" if kind == "writes" else "reads_from"
-            em.edge(em.file_node(member, x.get("file")), tid, etype, 0.8,
-                    description=f"{'writes' if kind == 'writes' else 'reads'} {display}")
+            for anchor in em.anchors(member, x.get("file"), all_tables=True):
+                em.edge(anchor, tid, etype, 0.8,
+                        description=f"{'writes' if kind == 'writes' else 'reads'} {display}")
         shared.append({"id": tid, "table": display, "members": touched,
                        "readers": sorted(readers), "writers": sorted(writers)})
     return {"shared": shared, "singleMember": single}

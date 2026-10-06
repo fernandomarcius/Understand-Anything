@@ -984,6 +984,115 @@ class TestLinkEndToEnd(_Workspace):
         self.assertEqual((self._bytes("knowledge-graph.json"), self._bytes("contracts-report.json")), before)
 
 
+SQL_SCRIPT = "db/migracoes/0004_cria_log_resumo.sql"
+COMPOSE = "docker-compose.yml"
+CFG_DOC = "conf/rotas.yaml"
+
+
+def _typed_node(ntype: str, nid: str, path: str) -> dict[str, Any]:
+    return {"id": nid, "type": ntype, "name": nid.rsplit(":", 1)[-1], "filePath": path,
+            "summary": f"{ntype} {nid}", "tags": [ntype], "complexity": "simple"}
+
+
+class TestAnchorWithoutFileNode(_Workspace):
+    """Files a member graph represents only with non-`file:` file-level nodes
+    (a .sql script as `table:` nodes, a compose file as a `service:` node)
+    still anchor their contract edges."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        gestao_nodes = [
+            # .sql script: two `table:` nodes, no `file:` node.
+            _typed_node("table", f"table:{SQL_SCRIPT}:dbo.LOG_RESUMO_HIST", SQL_SCRIPT),
+            _typed_node("table", f"table:{SQL_SCRIPT}:dbo.LOG_RESUMO", SQL_SCRIPT),
+            # compose file: only a `service:` node.
+            _typed_node("service", f"service:{COMPOSE}:gestao", COMPOSE),
+            # config + document on the same path: config wins by type priority.
+            _typed_node("document", f"document:{CFG_DOC}", CFG_DOC),
+            _typed_node("config", f"config:{CFG_DOC}", CFG_DOC),
+        ]
+        gestao = _contracts(
+            writes=[{"table": "dbo.LOG_RESUMO", "file": SQL_SCRIPT, "line": 3}],
+            consumers=[_cons("GET", "/carga_do_dia", COMPOSE, 20, base_type="literal",
+                             base_value="http://motor-calculo:8089", via="healthcheck")],
+            publish=[{"channel": "cflow.executar", "system": "codeq", "file": CFG_DOC, "line": 4}],
+        )
+        motor = _contracts(
+            providers=[_prov("GET", "/carga_do_dia", MOTOR_CTRL, 10, framework="flask")],
+            writes=[{"table": "dbo.LOG_RESUMO", "file": MOTOR_LOG, "line": 89}],
+            subscribe=[{"channel": "cflow.executar", "system": "codeq", "file": MOTOR_LOG, "line": 9}],
+            services=[{"name": "motor-calculo", "ports": ["8089:8089"], "hostnames": [],
+                       "source": "docker-compose.yml", "line": 25}],
+        )
+        self._member("gestao", _graph("g1", [GESTAO_OPS], extra_nodes=gestao_nodes), gestao)
+        self._member("motor", _graph("m1", [MOTOR_CTRL, MOTOR_LOG]), motor)
+        manifest = {"name": "anchors",
+                    "members": [{"name": n, "path": f"../{n}-repo"} for n in ("gestao", "motor")]}
+        (self.root / "ua-workspace.json").write_text(json.dumps(manifest), encoding="utf-8")
+        res = self._merge()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.res = res
+        self.g = self._read("knowledge-graph.json")
+
+    def _edges(self, etype: str) -> set[tuple[str, str]]:
+        return {(e["source"], e["target"]) for e in self.g["edges"] if e["type"] == etype}
+
+    def test_no_missing_file_node_warning(self) -> None:
+        self.assertNotIn("no file node", self.res.stderr)
+        self.assertFalse(any("no file node" in w for w in self._read("contracts-report.json")["warnings"]))
+
+    def test_sql_script_table_nodes_all_get_table_edges(self) -> None:
+        log = "table:workspace/dbo.LOG_RESUMO"
+        self.assertEqual(self._edges("writes_to"), {
+            (f"table:gestao/{SQL_SCRIPT}:dbo.LOG_RESUMO", log),
+            (f"table:gestao/{SQL_SCRIPT}:dbo.LOG_RESUMO_HIST", log),
+            (f"file:motor/{MOTOR_LOG}", log),
+        })
+
+    def test_compose_service_node_anchors_calls(self) -> None:
+        ep = f"endpoint:motor/{MOTOR_CTRL}:GET /carga_do_dia"
+        self.assertEqual(self._edges("calls"), {(f"service:gestao/{COMPOSE}:gestao", ep)})
+        self.assertEqual(self._edges("routes"), {(f"file:motor/{MOTOR_CTRL}", ep)})
+
+    def test_type_priority_prefers_config_over_document(self) -> None:
+        self.assertEqual(self._edges("publishes"),
+                         {(f"config:gestao/{CFG_DOC}", "concept:codeq/cflow.executar")})
+
+    def test_rerun_is_idempotent(self) -> None:
+        g1, r1 = self._bytes("knowledge-graph.json"), self._bytes("contracts-report.json")
+        for _ in range(2):
+            res = self._link()
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(self._bytes("knowledge-graph.json"), g1)
+            self.assertEqual(self._bytes("contracts-report.json"), r1)
+
+
+class TestEmitterAnchors(unittest.TestCase):
+    def _em(self, nodes: list[dict[str, Any]]) -> Any:
+        return lc._Emitter({"nodes": nodes, "edges": []}, [])
+
+    def test_file_id_wins_over_other_types(self) -> None:
+        em = self._em([_typed_node("config", "config:m/a.yml", "m/a.yml"),
+                       _typed_node("file", "file:m/a.yml", "m/a.yml")])
+        self.assertEqual(em.anchors("m", "a.yml", all_tables=True), ["file:m/a.yml"])
+
+    def test_tables_first_by_id_unless_table_edge(self) -> None:
+        em = self._em([_typed_node("table", "table:m/x.sql:b", "m/x.sql"),
+                       _typed_node("table", "table:m/x.sql:a", "m/x.sql")])
+        self.assertEqual(em.anchors("m", "x.sql"), ["table:m/x.sql:a"])
+        self.assertEqual(em.anchors("m", "x.sql", all_tables=True), ["table:m/x.sql:a", "table:m/x.sql:b"])
+
+    def test_endpoint_is_last_resort_and_missing_warns_once(self) -> None:
+        em = self._em([_typed_node("endpoint", "endpoint:m/c.cs:GET /x", "m/c.cs"),
+                       _typed_node("table", "table:m/c.cs:t", "m/c.cs")])
+        self.assertEqual(em.anchors("m", "c.cs"), ["table:m/c.cs:t"])
+        em = self._em([_typed_node("endpoint", "endpoint:m/c.cs:GET /x", "m/c.cs")])
+        self.assertEqual(em.anchors("m", "c.cs"), ["endpoint:m/c.cs:GET /x"])
+        self.assertEqual(em.anchors("m", "nope.cs"), [])
+        self.assertEqual(em.anchors("m", "nope.cs"), [])
+        self.assertEqual(len(em.warnings), 1)
+
+
 class TestNoContractsFlag(_Workspace):
     def test_merge_without_linking(self) -> None:
         self._standard()
