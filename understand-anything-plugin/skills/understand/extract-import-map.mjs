@@ -941,18 +941,19 @@ function extractKotlinSources(content) {
 // ---------------------------------------------------------------------------
 // Python resolver
 //
-// Tree-sitter's Python extractor emits one entry per import statement:
-//   - `import a.b.c`          -> { source: 'a.b.c', specifiers: ['a.b.c'] }
+// Python imports are parsed by `parsePythonImports` (below), not by the
+// tree-sitter extractor: tree-sitter only reports module-level statements and
+// records the ALIAS of `from . import repositorio as repo` instead of the
+// imported name, which loses function-local imports (common in tests and in
+// code avoiding import cycles) and breaks submodule probing. The parser
+// yields one entry per statement:
+//   - `import a.b.c [as z]`   -> { source: 'a.b.c', specifiers: [] }
 //   - `from a.b.c import x,y` -> { source: 'a.b.c', specifiers: ['x','y'] }
-//   - `from . import x`       -> { source: '', specifiers: ['x'] }
-//   - `from .x import y`      -> { source: '.x', specifiers: ['y'] }
+//   - `from . import x as y`  -> { source: '.',     specifiers: ['x'] }
+//   - `from .x import y`      -> { source: '.x',    specifiers: ['y'] }
 //   - `from ..pkg import y`   -> { source: '..pkg', specifiers: ['y'] }
 //
-// We can't tell relative from absolute by the source string alone — the dots
-// could be a leading-dot relative source OR a literal `.` package separator.
-// Python's lexical convention disambiguates: leading dots ALWAYS mean
-// relative. Tree-sitter preserves leading dots verbatim in the source field,
-// so we can dispatch on the prefix.
+// Leading dots ALWAYS mean relative (Python's lexical convention).
 //
 // Resolution rules:
 //   1. Relative (starts with `.`): walk up parent dirs by leading-dot count,
@@ -962,23 +963,481 @@ function extractKotlinSources(content) {
 //      under which probing succeeds wins. This matches how multi-service
 //      Python repos work in practice — each service directory acts as its
 //      own root for unqualified `import sibling` style imports
-//      (e.g. microservices-demo's per-service grpc stubs).
+//      (e.g. microservices-demo's per-service grpc stubs). Importer-scope
+//      precedence (deepest ancestor first) keeps same-named modules of
+//      different services from cross-linking.
+//   3. Absolute, not found by (2): probe the DISCOVERED package roots
+//      (`buildPythonIndex`) — src-layout and multi-package monorepos where
+//      `from csf_core.db import x` lives under `core/src/csf_core/`. Roots
+//      come from pyproject.toml / setup.cfg / setup.py / pytest.ini (the
+//      config dir, its `src/`, setuptools `where`/`package-dir`, hatch
+//      `packages`, poetry `from`, pytest `pythonpath`) plus, per package
+//      name, the parent of a unique top-level package imported from at
+//      least two files. Stdlib names never take this path, and a root only
+//      matches when the top-level package/module actually exists under it.
 //
-//      We don't gate this on setup.py / pyproject.toml detection. The
-//      probe itself IS the test of whether the ancestor is a candidate
-//      root: an absent module just continues the walk. The closest
-//      ancestor where the import resolves wins, which gives importer
-//      scope precedence (sibling files override remote candidates).
+// Package edges: `from pkg import name` links `pkg/name.py` (or
+// `pkg/name/__init__.py`) when `name` is a submodule, and links
+// `pkg/__init__.py` only when `name` is NOT a submodule (it must come from
+// the package) or `__init__.py` binds it (def/class/assignment/import or
+// `__all__`). A bare `import pkg` links `pkg/__init__.py`.
 // ---------------------------------------------------------------------------
+
+// Top-level stdlib module names (CPython 3.8-3.14, including modules removed
+// in 3.12/3.13). Never resolved through discovered/inferred roots.
+const PY_STDLIB = new Set((
+  '__future__ abc aifc annotationlib antigravity argparse array ast asynchat ' +
+  'asyncio asyncore atexit audioop base64 bdb binascii binhex bisect builtins ' +
+  'bz2 cProfile calendar cgi cgitb chunk cmath cmd code codecs codeop ' +
+  'collections colorsys compileall compression concurrent configparser ' +
+  'contextlib contextvars copy copyreg crypt csv ctypes curses dataclasses ' +
+  'datetime dbm decimal difflib dis distutils doctest email encodings ' +
+  'ensurepip enum errno faulthandler fcntl filecmp fileinput fnmatch ' +
+  'formatter fractions ftplib functools gc genericpath getopt getpass gettext ' +
+  'glob graphlib grp gzip hashlib heapq hmac html http idlelib imaplib imghdr ' +
+  'imp importlib inspect io ipaddress itertools json keyword lib2to3 ' +
+  'linecache locale logging lzma mailbox mailcap marshal math mimetypes mmap ' +
+  'modulefinder msilib msvcrt multiprocessing netrc nis nntplib nt ntpath ' +
+  'nturl2path numbers opcode operator optparse os ossaudiodev parser pathlib ' +
+  'pdb pickle pickletools pipes pkgutil platform plistlib poplib posix ' +
+  'posixpath pprint profile pstats pty pwd py_compile pyclbr pydoc ' +
+  'pydoc_data pyexpat queue quopri random re readline reprlib resource ' +
+  'rlcompleter runpy sched secrets select selectors shelve shlex shutil ' +
+  'signal site smtpd smtplib sndhdr socket socketserver spwd sqlite3 ' +
+  'sre_compile sre_constants sre_parse ssl stat statistics string stringprep ' +
+  'struct subprocess sunau symbol symtable sys sysconfig syslog tabnanny ' +
+  'tarfile telnetlib tempfile termios textwrap this threading time timeit ' +
+  'tkinter token tokenize tomllib trace traceback tracemalloc tty turtle ' +
+  'turtledemo types typing unicodedata unittest urllib uu uuid venv warnings ' +
+  'wave weakref webbrowser winreg winsound wsgiref xdrlib xml xmlrpc zipapp ' +
+  'zipfile zipimport zlib zoneinfo'
+).split(' '));
+
+const PY_ID = '[\\p{L}_][\\p{L}\\p{N}_]*';
+const PY_DOTTED = `${PY_ID}(?:\\s*\\.\\s*${PY_ID})*`;
+const PY_FROM_RE = new RegExp(
+  `^from(?=[\\s.])\\s*(\\.+(?:\\s*${PY_DOTTED})?|${PY_DOTTED})\\s*import(?=[\\s(*])\\s*(.+)$`, 'u',
+);
+const PY_IMPORT_RE = new RegExp(`^import\\s+(.+)$`, 'u');
+const PY_NAME_RE = new RegExp(`^(${PY_ID}|\\*)(?:\\s+as\\s+(${PY_ID}))?$`, 'u');
+const PY_MODULE_RE = new RegExp(`^(${PY_DOTTED})(?:\\s+as\\s+(${PY_ID}))?$`, 'u');
+// `if TYPE_CHECKING: import x` / `try: import x` — single-line compound
+// statement whose body is an import.
+const PY_INLINE_BODY_RE =
+  /^(?:try|else|finally|(?:el)?if\b[^:]*|except\b[^:]*|with\b[^:]*)\s*:\s*((?:from|import)\s.*)$/u;
+const PY_DEF_RE = new RegExp(`^(?:async\\s+)?(?:def|class)\\s+(${PY_ID})`, 'u');
+const PY_ASSIGN_RE = new RegExp(`^(${PY_ID})\\s*(?::[^=]*)?=(?!=)`, 'u');
+
+/**
+ * Split Python source into logical lines with comments removed and string
+ * literals blanked to `""` (so docstrings that quote code never look like
+ * imports). Bracketed continuations and backslash continuations are joined;
+ * `;` splits statements. Leading indentation is dropped.
+ */
+export function pythonLogicalLines(content) {
+  const src = content.replace(/\r\n?/g, '\n');
+  const lines = [];
+  let cur = '';
+  let depth = 0;
+  const n = src.length;
+  const flush = () => {
+    const t = cur.trim();
+    if (t) lines.push(t);
+    cur = '';
+  };
+  let i = 0;
+  while (i < n) {
+    const ch = src[i];
+    if (ch === '#') {
+      while (i < n && src[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const triple = src.startsWith(ch + ch + ch, i);
+      const q = triple ? ch + ch + ch : ch;
+      i += q.length;
+      while (i < n) {
+        if (src[i] === '\\') { i += 2; continue; }
+        if (src.startsWith(q, i)) { i += q.length; break; }
+        if (!triple && src[i] === '\n') break; // unterminated literal
+        i++;
+      }
+      cur += '""';
+      continue;
+    }
+    if (ch === '\\' && src[i + 1] === '\n') {
+      cur += ' ';
+      i += 2;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1);
+    if (ch === '\n') {
+      if (depth > 0) cur += ' ';
+      else flush();
+      i++;
+      continue;
+    }
+    if (ch === ';' && depth === 0) {
+      flush();
+      i++;
+      continue;
+    }
+    cur += ch;
+    i++;
+  }
+  flush();
+  return lines;
+}
+
+/**
+ * Parse every import statement of a Python file — module level, nested in
+ * functions/classes, inside try/if blocks, parenthesized or continued.
+ * Returns `[{ source, specifiers }]` with the IMPORTED names (aliases
+ * dropped). `from __future__` is skipped.
+ */
+export function parsePythonImports(content) {
+  const out = [];
+  for (let line of pythonLogicalLines(content)) {
+    const inline = line.match(PY_INLINE_BODY_RE);
+    if (inline) line = inline[1];
+    let m = line.match(PY_FROM_RE);
+    if (m) {
+      const source = m[1].replace(/\s+/g, '');
+      if (source === '__future__') continue;
+      const specifiers = [];
+      for (const part of m[2].replace(/[()]/g, ' ').split(',')) {
+        const nm = part.trim().match(PY_NAME_RE);
+        if (nm) specifiers.push(nm[1]);
+      }
+      out.push({ source, specifiers });
+      continue;
+    }
+    m = line.match(PY_IMPORT_RE);
+    if (m) {
+      for (const part of m[1].split(',')) {
+        const mm = part.trim().match(PY_MODULE_RE);
+        if (mm) out.push({ source: mm[1].replace(/\s+/g, ''), specifiers: [] });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Names a module binds (approximation, any indentation): def/class names,
+ * simple assignments, import bindings and `__all__` entries. Used to decide
+ * whether `from pkg import name` touches `pkg/__init__.py`.
+ */
+export function pythonBoundNames(content) {
+  const names = new Set();
+  for (const line of pythonLogicalLines(content)) {
+    let m = line.match(PY_DEF_RE);
+    if (m) { names.add(m[1]); continue; }
+    const body = (line.match(PY_INLINE_BODY_RE) || [null, line])[1];
+    m = body.match(PY_FROM_RE);
+    if (m) {
+      for (const part of m[2].replace(/[()]/g, ' ').split(',')) {
+        const nm = part.trim().match(PY_NAME_RE);
+        if (nm && nm[1] !== '*') names.add(nm[2] || nm[1]);
+      }
+      continue;
+    }
+    m = body.match(PY_IMPORT_RE);
+    if (m) {
+      for (const part of m[1].split(',')) {
+        const mm = part.trim().match(PY_MODULE_RE);
+        if (mm) names.add(mm[2] || mm[1].split('.')[0].trim());
+      }
+      continue;
+    }
+    m = line.match(PY_ASSIGN_RE);
+    if (m) names.add(m[1]);
+  }
+  // __all__ entries live inside string literals, which the logical-line
+  // pass blanks — read them from the raw text.
+  const allRe = /__all__\s*(?:\+=|=|:[^=\n]*=)\s*[[(]([\s\S]*?)[\])]/g;
+  let a;
+  while ((a = allRe.exec(content)) !== null) {
+    for (const s of a[1].matchAll(/(['"])([^'"]+)\1/g)) names.add(s[2]);
+  }
+  return names;
+}
+
+/**
+ * Normalize `rel` against `dir`; null when it escapes the project root or is
+ * absolute.
+ */
+function pyJoinDir(dir, rel) {
+  if (typeof rel !== 'string') return null;
+  const r = rel.trim().replace(/\\/g, '/');
+  if (!r || r.startsWith('/') || /^[A-Za-z]:/.test(r)) return null;
+  const stack = dir ? dir.split('/').filter(Boolean) : [];
+  for (const part of r.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      if (stack.length === 0) return null;
+      stack.pop();
+    } else {
+      stack.push(part);
+    }
+  }
+  return stack.join('/');
+}
+
+const quotedStrings = text =>
+  [...String(text).matchAll(/"([^"]*)"|'([^']*)'/g)].map(m => m[1] ?? m[2]);
+
+/**
+ * Minimal TOML scan: returns [{ section, key, value }] with multi-line
+ * arrays/inline tables joined. Enough for the handful of path-valued keys
+ * the Python root discovery reads; not a general TOML parser.
+ */
+function scanTomlEntries(raw) {
+  const entries = [];
+  let section = '';
+  let pending = null;
+  let depth = 0;
+  const stripComment = line => {
+    let q = null;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (q) { if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") q = c;
+      else if (c === '#') return line.slice(0, i);
+    }
+    return line;
+  };
+  const countDepth = s => {
+    let d = 0;
+    let q = null;
+    for (const c of s) {
+      if (q) { if (c === q) q = null; continue; }
+      if (c === '"' || c === "'") q = c;
+      else if (c === '[' || c === '{') d++;
+      else if (c === ']' || c === '}') d--;
+    }
+    return d;
+  };
+  for (const rawLine of raw.replace(/\r\n?/g, '\n').split('\n')) {
+    const line = stripComment(rawLine);
+    if (pending) {
+      pending.value += ' ' + line.trim();
+      depth += countDepth(line);
+      if (depth <= 0) { entries.push(pending); pending = null; }
+      continue;
+    }
+    const header = line.match(/^\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*$/);
+    if (header) { section = header[1].replace(/["'\s]/g, ''); continue; }
+    const kv = line.match(/^\s*([A-Za-z0-9_.\-"']+)\s*=\s*(.*)$/);
+    if (!kv) continue;
+    const entry = { section, key: kv[1].replace(/["']/g, ''), value: kv[2].trim() };
+    depth = countDepth(kv[2]);
+    if (depth > 0) pending = entry;
+    else entries.push(entry);
+  }
+  if (pending) entries.push(pending);
+  return entries;
+}
+
+/**
+ * Read declared Python roots (project-relative dirs) from one config file.
+ * `cfgDir` is the config's directory; returned paths are not yet checked
+ * for existence.
+ */
+function pythonRootsFromConfig(cfgPath, cfgDir, raw) {
+  const roots = [];
+  const add = rel => {
+    const p = pyJoinDir(cfgDir, rel);
+    if (p !== null) roots.push(p);
+  };
+  const base = cfgPath.slice(cfgPath.lastIndexOf('/') + 1);
+  if (base === 'pyproject.toml') {
+    for (const { section, key, value } of scanTomlEntries(raw)) {
+      if (section === 'tool.setuptools.packages.find' && key === 'where') {
+        quotedStrings(value).forEach(add);
+      } else if (key === 'package-dir' || key === 'package_dir') {
+        // setuptools: {"" = "src"}; pdm: package-dir = "src".
+        if (value.startsWith('{')) {
+          for (const m of value.matchAll(/(["'])(.*?)\1\s*=\s*(["'])(.*?)\3/g)) {
+            if (m[2] === '') add(m[4]);
+          }
+        } else {
+          quotedStrings(value).forEach(add);
+        }
+      } else if (section.startsWith('tool.hatch.build') && key === 'packages') {
+        for (const p of quotedStrings(value)) {
+          const full = pyJoinDir(cfgDir, p);
+          if (full !== null) roots.push(dirOf(full));
+        }
+      } else if (section === 'tool.poetry' && key === 'packages') {
+        for (const m of value.matchAll(/\bfrom\s*=\s*(["'])(.*?)\1/g)) add(m[2]);
+      } else if (section === 'tool.pytest.ini_options' && key === 'pythonpath') {
+        quotedStrings(value).flatMap(v => v.split(/\s+/)).filter(Boolean).forEach(add);
+      }
+    }
+    return roots;
+  }
+  if (base === 'setup.cfg' || base === 'pytest.ini' || base === 'tox.ini') {
+    // INI: `key = value` with indented continuation lines.
+    let section = '';
+    let current = null;
+    const values = [];
+    for (const rawLine of raw.replace(/\r\n?/g, '\n').split('\n')) {
+      if (/^\s*[#;]/.test(rawLine)) continue;
+      const header = rawLine.match(/^\s*\[([^\]]+)\]\s*$/);
+      if (header) { section = header[1].trim(); current = null; continue; }
+      const kv = rawLine.match(/^([A-Za-z0-9_.-]+)\s*[=:]\s*(.*)$/);
+      if (kv) {
+        current = { section, key: kv[1], value: kv[2] };
+        values.push(current);
+      } else if (current && /^\s+\S/.test(rawLine)) {
+        current.value += '\n' + rawLine.trim();
+      }
+    }
+    for (const { section: s, key, value } of values) {
+      if (s === 'options.packages.find' && key === 'where') {
+        value.split(/\s+/).filter(Boolean).forEach(add);
+      } else if (s === 'options' && key === 'package_dir') {
+        for (const m of value.matchAll(/(?:^|\n)\s*=\s*(\S+)/g)) add(m[1]);
+      } else if ((s === 'tool:pytest' || s === 'pytest') && key === 'pythonpath') {
+        value.split(/\s+/).filter(Boolean).forEach(add);
+      }
+    }
+    return roots;
+  }
+  if (base === 'setup.py') {
+    for (const m of raw.matchAll(/package_dir\s*=\s*\{\s*(["'])\1\s*:\s*(["'])([^"']+)\2/g)) add(m[3]);
+    for (const m of raw.matchAll(/find_(?:namespace_)?packages\(\s*(?:where\s*=\s*)?(["'])([^"']+)\1/g)) add(m[2]);
+  }
+  return roots;
+}
+
+const PY_ROOT_CONFIGS = new Set(['pyproject.toml', 'setup.cfg', 'setup.py', 'pytest.ini', 'tox.ini']);
+
+/**
+ * Build the Python resolution index once per run (reads the configs and the
+ * FULL Python inventory, so narrowed `analysisPaths` runs infer the same
+ * roots as full runs):
+ *   - pyDirs:      dirs with at least one `.py` file below them
+ *   - existingDirs: dirs containing any inventory file (for `<cfg>/src`)
+ *   - initBindings: Map<`.../__init__.py`, Set<name> | null(unreadable)>
+ *   - roots:       [{ dir, names: Set | null }] — declared (names null) then
+ *                  inferred per package name
+ */
+async function buildPythonIndex(projectRoot, files, fileSet) {
+  const warnings = [];
+  const failures = [];
+  const pyDirs = new Set();
+  const existingDirs = new Set(['']);
+  const pyFiles = [];
+  for (const f of files) {
+    const p = toPosix(f.path);
+    let d = dirOf(p);
+    while (d && !existingDirs.has(d)) { existingDirs.add(d); d = dirOf(d); }
+    if (p.endsWith('.py')) {
+      pyFiles.push(p);
+      let pd = dirOf(p);
+      while (pd && !pyDirs.has(pd)) { pyDirs.add(pd); pd = dirOf(pd); }
+    }
+  }
+  pyFiles.sort(comparePaths);
+
+  const cfgPaths = [...fileSet]
+    .filter(p => PY_ROOT_CONFIGS.has(p.slice(p.lastIndexOf('/') + 1)))
+    .sort(comparePaths);
+  const [cfgReads, pyReads] = await Promise.all([
+    readFilesParallel(cfgPaths.map(p => ({ key: p, absPath: join(projectRoot, p) }))),
+    readFilesParallel(pyFiles.map(p => ({ key: p, absPath: join(projectRoot, p) }))),
+  ]);
+
+  const declared = [];
+  const seenDeclared = new Set();
+  const addDeclared = dir => {
+    if (dir === null || seenDeclared.has(dir) || !existingDirs.has(dir)) return;
+    seenDeclared.add(dir);
+    declared.push({ dir, names: null });
+  };
+  for (const { key, raw, err } of cfgReads) {
+    const cfgDir = dirOf(key);
+    const base = key.slice(key.lastIndexOf('/') + 1);
+    // Only packaging configs make their own dir (and its src/) a root;
+    // pytest.ini/tox.ini contribute their explicit pythonpath only.
+    if (base === 'pyproject.toml' || base === 'setup.cfg' || base === 'setup.py') {
+      addDeclared(cfgDir);
+      addDeclared(cfgDir ? `${cfgDir}/src` : 'src');
+    }
+    if (err) {
+      failures.push({ path: key, stage: 'python-config-read', message: err.message });
+      warnings.push(
+        `Warning: extract-import-map: failed to read ${key} ` +
+        `(${err.message}) — Python roots declared there are ignored\n`,
+      );
+      continue;
+    }
+    for (const r of pythonRootsFromConfig(key, cfgDir, raw)) addDeclared(r);
+  }
+  addDeclared('');
+
+  // Per-name inferred roots: a top-level package imported (absolutely) from
+  // at least two files, with exactly one top-level package dir of that name
+  // in the inventory, contributes its parent dir as a root for that name.
+  const importersByTop = new Map();
+  const initBindings = new Map();
+  for (const { key, raw } of pyReads) {
+    if (key.endsWith('/__init__.py') || key === '__init__.py') {
+      initBindings.set(key, raw === null ? null : pythonBoundNames(raw));
+    }
+    if (raw === null) continue;
+    for (const imp of parsePythonImports(raw)) {
+      if (imp.source.startsWith('.')) continue;
+      const top = imp.source.split('.')[0];
+      if (PY_STDLIB.has(top)) continue;
+      if (!importersByTop.has(top)) importersByTop.set(top, new Set());
+      importersByTop.get(top).add(key);
+    }
+  }
+  const pkgDirsByName = new Map();
+  for (const d of pyDirs) {
+    const parent = dirOf(d);
+    if (fileSet.has(parent ? `${parent}/__init__.py` : '__init__.py') && parent) continue;
+    const name = d.slice(d.lastIndexOf('/') + 1);
+    if (!pkgDirsByName.has(name)) pkgDirsByName.set(name, []);
+    pkgDirsByName.get(name).push(d);
+  }
+  const inferred = new Map();
+  for (const [top, importers] of [...importersByTop].sort((a, b) => comparePaths(a[0], b[0]))) {
+    if (importers.size < 2) continue;
+    const candidates = (pkgDirsByName.get(top) || []).filter(d => fileSet.has(`${d}/__init__.py`));
+    if (candidates.length !== 1) continue;
+    const parent = dirOf(candidates[0]);
+    if (seenDeclared.has(parent)) continue;
+    if (!inferred.has(parent)) inferred.set(parent, new Set());
+    inferred.get(parent).add(top);
+  }
+  const roots = declared.concat(
+    [...inferred].sort((a, b) => comparePaths(a[0], b[0])).map(([dir, names]) => ({ dir, names })),
+  );
+
+  return { pyDirs, initBindings, roots, warnings, failures };
+}
 
 /**
  * Resolve a Python import. Unlike most resolvers this can produce multiple
- * matches (one for the package `__init__.py` plus one per submodule
- * specifier), so the signature differs: returns string[].
+ * matches (the package `__init__.py` and/or one per submodule specifier),
+ * so the signature differs: returns string[].
  *
  * Returns empty array for external/unresolved packages.
  */
 export function resolvePythonImport(rawImport, specifiers, file, ctx) {
+  // A package's own `__init__.py` doing `from . import x` would otherwise
+  // link to itself when it also binds `x`.
+  const self = toPosix(file.path);
+  return resolvePythonImportTargets(rawImport, specifiers, file, ctx)
+    .filter(p => p !== self);
+}
+
+function resolvePythonImportTargets(rawImport, specifiers, file, ctx) {
   if (typeof rawImport !== 'string') return [];
   const src = rawImport;
   const importerDir = dirOf(toPosix(file.path));
@@ -1003,49 +1462,20 @@ export function resolvePythonImport(rawImport, specifiers, file, ctx) {
     }
     const baseParts = importerParts.slice(0, importerParts.length - dropLevels);
 
-    // `from .[..] import x, y` with no dotted tail — specifiers are siblings
-    // at `baseParts`. Probe directly without requiring `<baseParts>/__init__.py`
-    // to exist: PEP 328 implicit namespace packages are common in modern
-    // Python (no `__init__.py`), and `resolvePythonProbe` would otherwise
-    // gate specifier resolution on the package marker and drop these imports.
+    // `from .[..] import x, y` with no dotted tail — the anchor package is
+    // implicit and always "exists" (PEP 420 namespace packages need no
+    // `__init__.py`), so probe the specifiers directly.
     if (tailSegments.length === 0) {
-      if (!Array.isArray(specifiers) || specifiers.length === 0) return [];
-      const base = baseParts.join('/');
-      const matches = [];
-      for (const spec of specifiers) {
-        // Wildcard `*` and qualified specifiers (`Foo.bar`) skip; the
-        // surface name is what tree-sitter records for `from . import x`.
-        if (!spec || spec === '*' || spec.includes('.')) continue;
-        const subFile = base ? `${base}/${spec}.py` : `${spec}.py`;
-        const subInit = base ? `${base}/${spec}/__init__.py` : `${spec}/__init__.py`;
-        if (ctx.fileSet.has(subFile)) matches.push(subFile);
-        else if (ctx.fileSet.has(subInit)) matches.push(subInit);
-      }
-      return matches;
+      return resolvePythonPackageMembers(baseParts.join('/'), specifiers, ctx);
     }
 
     const moduleParts = baseParts.concat(tailSegments);
     return resolvePythonProbe(moduleParts, specifiers, ctx);
   }
 
-  // Absolute import. Walk up from the importer's directory and try every
-  // ancestor as a candidate Python root — the first one where probing
-  // resolves anything wins. This handles the multi-service / multi-package
-  // case where each service's directory acts as its own implicit
-  // sys.path entry (e.g. `import demo_pb2_grpc` from
-  // `src/emailservice/email_server.py` should resolve to
-  // `src/emailservice/demo_pb2_grpc.py`, NOT fail because the file isn't
-  // at `<projectRoot>/demo_pb2_grpc.py`).
-  //
-  // Importer-scope precedence (deepest ancestor first) means that when
-  // the same module name exists in multiple services, each service's
-  // file shadows the others — no cross-service edges.
-  if (tailSegments.length === 0) {
-    // `from . import x` is dots>0 only; reaching here means the source
-    // was the empty string. Nothing to probe.
-    return [];
-  }
+  if (tailSegments.length === 0) return [];
 
+  // Absolute import, step 1: importer ancestors, deepest first.
   const importerParts = importerDir ? importerDir.split('/').filter(Boolean) : [];
   for (let i = importerParts.length; i >= 0; i--) {
     const rootParts = importerParts.slice(0, i);
@@ -1053,50 +1483,95 @@ export function resolvePythonImport(rawImport, specifiers, file, ctx) {
     const matches = resolvePythonProbe(candidateModule, specifiers, ctx);
     if (matches.length > 0) return matches;
   }
+
+  // Step 2: discovered package roots (src-layout / multi-package repos).
+  const py = ctx.python;
+  const top = tailSegments[0];
+  if (!py || PY_STDLIB.has(top)) return [];
+  for (const root of orderPythonRoots(py.roots, importerParts)) {
+    if (root.names && !root.names.has(top)) continue;
+    const topPath = root.dir ? `${root.dir}/${top}` : top;
+    const topExists =
+      ctx.fileSet.has(`${topPath}.py`) ||
+      ctx.fileSet.has(`${topPath}/__init__.py`) ||
+      py.pyDirs.has(topPath);
+    if (!topExists) continue;
+    const rootParts = root.dir ? root.dir.split('/') : [];
+    const matches = resolvePythonProbe(rootParts.concat(tailSegments), specifiers, ctx);
+    if (matches.length > 0) return matches;
+  }
   return [];
 }
 
 /**
+ * Order roots for one importer: the root sharing the longest directory
+ * prefix with the importer first (a package's own `src/` beats a sibling
+ * package's), then by path for determinism.
+ */
+function orderPythonRoots(roots, importerParts) {
+  const shared = dir => {
+    if (!dir) return 0;
+    const parts = dir.split('/');
+    let k = 0;
+    while (k < parts.length && k < importerParts.length && parts[k] === importerParts[k]) k++;
+    return k;
+  };
+  return roots
+    .map(r => ({ r, s: shared(r.dir) }))
+    .sort((a, b) => (b.s - a.s) || comparePaths(a.r.dir, b.r.dir))
+    .map(x => x.r);
+}
+
+/**
+ * `from <pkg> import a, b` where `<pkg>` (dir `base`) is a package: each
+ * specifier that is a submodule links that submodule; `__init__.py` is
+ * linked when some specifier is not a submodule (or is `*`), when
+ * `__init__.py` binds a specifier, or when there are no specifiers
+ * (`import pkg`).
+ */
+function resolvePythonPackageMembers(base, specifiers, ctx) {
+  const initPath = base ? `${base}/__init__.py` : '__init__.py';
+  const hasInit = ctx.fileSet.has(initPath);
+  const bound = hasInit ? ctx.python?.initBindings.get(initPath) : undefined;
+  // Unknown bindings (no index / unreadable) -> keep the init edge.
+  const initBinds = name => bound === undefined || bound === null || bound.has(name);
+  const specs = Array.isArray(specifiers) ? specifiers : [];
+  const matches = [];
+  let needsInit = specs.length === 0;
+  for (const spec of specs) {
+    if (!spec || spec.includes('.')) continue;
+    if (spec === '*') { needsInit = true; continue; }
+    const subFile = base ? `${base}/${spec}.py` : `${spec}.py`;
+    const subInit = base ? `${base}/${spec}/__init__.py` : `${spec}/__init__.py`;
+    if (ctx.fileSet.has(subFile)) {
+      matches.push(subFile);
+      if (initBinds(spec)) needsInit = true;
+    } else if (ctx.fileSet.has(subInit)) {
+      matches.push(subInit);
+      if (initBinds(spec)) needsInit = true;
+    } else {
+      needsInit = true;
+    }
+  }
+  if (needsInit && hasInit) matches.unshift(initPath);
+  return matches;
+}
+
+/**
  * Given a fully-qualified module-path segment list (e.g. ['src','utils']),
- * probe the file set for `a/b/c.py` then `a/b/c/__init__.py`. On package
- * match, also probe each specifier as a submodule. Returns an array of
- * resolved project-relative paths (deduped by Set in caller).
+ * probe the file set for `a/b/c.py`, then the package `a/b/c/` (regular via
+ * `__init__.py`, or a PEP 420 namespace dir holding `.py` files) whose
+ * members are resolved by `resolvePythonPackageMembers`.
  */
 function resolvePythonProbe(moduleParts, specifiers, ctx) {
-  if (moduleParts.length === 0) {
-    // `from . import x` case: importer's package is the implicit module;
-    // each x is a sibling module to probe directly.
-    return [];
-  }
+  if (moduleParts.length === 0) return [];
   const base = moduleParts.join('/');
-  const matches = [];
-
   const moduleFile = `${base}.py`;
-  const packageInit = `${base}/__init__.py`;
-
-  if (ctx.fileSet.has(moduleFile)) {
-    matches.push(moduleFile);
-    return matches; // No further probing on a leaf module file.
-  }
-  if (ctx.fileSet.has(packageInit)) {
-    matches.push(packageInit);
-    // Package match: probe each specifier as a submodule
-    if (Array.isArray(specifiers)) {
-      for (const spec of specifiers) {
-        // Wildcard `*` and qualified specifiers (`Foo.bar`) skip; the
-        // surface name is what tree-sitter records for `from pkg import x`.
-        if (!spec || spec === '*' || spec.includes('.')) continue;
-        const subFile = `${base}/${spec}.py`;
-        const subInit = `${base}/${spec}/__init__.py`;
-        if (ctx.fileSet.has(subFile)) matches.push(subFile);
-        else if (ctx.fileSet.has(subInit)) matches.push(subInit);
-      }
-    }
-    return matches;
-  }
-
-  // No match — external package.
-  return [];
+  if (ctx.fileSet.has(moduleFile)) return [moduleFile];
+  const isPackage =
+    ctx.fileSet.has(`${base}/__init__.py`) || Boolean(ctx.python?.pyDirs.has(base));
+  if (!isPackage) return [];
+  return resolvePythonPackageMembers(base, specifiers, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -2490,6 +2965,15 @@ async function main() {
   const ctx = await buildResolutionContext(projectRoot, files);
   failures.push(...ctx.failures);
 
+  // Python resolves absolute imports against package roots discovered from
+  // the FULL inventory (configs + every .py), so narrowed runs agree with
+  // full ones.
+  if (analysisFiles.some(f => f.fileCategory === 'code' && f.language === 'python')) {
+    ctx.python = await buildPythonIndex(projectRoot, files, ctx.fileSet);
+    for (const w of ctx.python.warnings) process.stderr.write(w);
+    failures.push(...ctx.python.failures);
+  }
+
   // C# resolves through a solution-wide namespace index built from the FULL
   // inventory (a narrowed analysisPaths still needs every declaring file).
   if (
@@ -2549,6 +3033,14 @@ async function main() {
       if (file.language === 'csharp') {
         for (const out of resolveCSharpFile(path, content, ctx.csharpIndex)) {
           if (ctx.fileSet.has(out)) resolvedSet.add(out);
+        }
+      } else if (file.language === 'python') {
+        // Own parser: tree-sitter misses function-local imports and records
+        // aliases instead of imported names (see the Python resolver notes).
+        for (const imp of parsePythonImports(content)) {
+          for (const out of resolvePythonImport(imp.source, imp.specifiers, file, ctx)) {
+            if (out && ctx.fileSet.has(out)) resolvedSet.add(out);
+          }
         }
       } else if (file.language === 'ruby') {
         for (const imp of parseRubyImports(content)) {

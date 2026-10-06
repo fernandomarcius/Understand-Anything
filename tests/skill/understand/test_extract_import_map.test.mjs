@@ -942,12 +942,12 @@ describe('extract-import-map.mjs — Python resolver', () => {
 
     expect(result.status).toBe(0);
     // `import src.utils.formatter` -> src/utils/formatter.py
-    // `from src.utils import formatter` -> src/utils/__init__.py + src/utils/formatter.py
-    // `from src import config` -> src/__init__.py + src/config.py
+    // `from src.utils import formatter` -> src/utils/formatter.py
+    // `from src import config` -> src/config.py
+    // The (empty) `__init__.py` files do not define `formatter`/`config`, so
+    // they get no edge: the import targets the submodule, not the package.
     expect(result.output.importMap['main.py']).toEqual([
-      'src/__init__.py',
       'src/config.py',
-      'src/utils/__init__.py',
       'src/utils/formatter.py',
     ]);
   });
@@ -1012,6 +1012,180 @@ describe('extract-import-map.mjs — Python resolver', () => {
     expect(result.output.importMap['src/svc_b/main.py']).not.toContain(
       'src/svc_a/helpers.py',
     );
+  });
+});
+
+describe('extract-import-map.mjs — Python packages, submodules and roots', () => {
+  let projectRoot;
+
+  afterEach(() => {
+    if (projectRoot) {
+      rmSync(projectRoot, { recursive: true, force: true });
+      projectRoot = null;
+    }
+  });
+
+  const pyFiles = paths => paths.map(path => ({
+    path,
+    language: path.endsWith('.py') ? 'python' : 'unknown',
+    fileCategory: path.endsWith('.py') ? 'code' : 'config',
+  }));
+
+  it('resolves relative imports of submodules (aliases, nested, multi-line) and links __init__.py only when it defines the name', () => {
+    const tree = {
+      'pkg/__init__.py': `from .api import publico\n__all__ = ['publico', 'reexport']\nreexport = 1\n`,
+      'pkg/api.py': `publico = 1\n`,
+      'pkg/ingestao/__init__.py': `# pacote\n`,
+      'pkg/ingestao/repositorio.py': `x = 1\n`,
+      'pkg/ingestao/motor.py': `def rodar(): pass\ndef parar(): pass\n`,
+      'pkg/ingestao/fake.py': `x = 1\n`,
+      'pkg/ingestao/leitura.py': [
+        '"""Docstring citing code.',
+        '',
+        'from .fake import x',
+        '"""',
+        'from . import repositorio as repo',
+        'from .. import reexport',
+        'from ..ingestao import repositorio',
+        '',
+        'def f():',
+        '    from .motor import (',
+        '        rodar,',
+        '        parar as p,',
+        '    )',
+        '    return repo, rodar, p',
+        '',
+      ].join('\n'),
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    // `from . import repositorio as repo` -> the submodule, despite the alias.
+    // `from .. import reexport` -> pkg/__init__.py (the name lives there).
+    // `from ..ingestao import repositorio` -> only the submodule: the
+    //   ingestao/__init__.py does not define `repositorio`.
+    // Function-local multi-line `from .motor import (...)` -> motor.py.
+    // The docstring's `from .fake import x` is text, not an import.
+    expect(result.output.importMap['pkg/ingestao/leitura.py']).toEqual([
+      'pkg/__init__.py',
+      'pkg/ingestao/motor.py',
+      'pkg/ingestao/repositorio.py',
+    ]);
+    // `from .api import publico` inside __init__.py -> pkg/api.py.
+    expect(result.output.importMap['pkg/__init__.py']).toEqual(['pkg/api.py']);
+  });
+
+  it('parses compact import forms (`import*`, `from .import x`, `if X: import y`)', () => {
+    const tree = {
+      'libs.py': `x = 1\n`,
+      'app/__init__.py': ``,
+      'app/creds.py': `x = 1\n`,
+      'app/util.py': `x = 1\n`,
+      'app/tipos.py': `x = 1\n`,
+      'app/main.py':
+        `from libs import*\nfrom .import creds\nfrom.util import(x)\nif TYPE_CHECKING: from . import tipos\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['app/main.py']).toEqual([
+      'app/creds.py',
+      'app/tipos.py',
+      'app/util.py',
+      'libs.py',
+    ]);
+  });
+
+  it('resolves absolute imports of src-layout packages across a multi-package monorepo', () => {
+    const tree = {
+      'core/pyproject.toml': `[project]\nname = "acme-core"\n\n[tool.hatch.build.targets.wheel]\npackages = ["src/acme_core"]\n`,
+      'core/src/acme_core/__init__.py': ``,
+      'core/src/acme_core/db.py': `def transacao(): pass\n`,
+      'core/src/acme_core/auth/__init__.py': ``,
+      'core/src/acme_core/auth/sessoes.py': `x = 1\n`,
+      'api/pyproject.toml': `[project]\nname = "acme-api"\n`,
+      'api/src/acme_api/__init__.py': ``,
+      'api/src/acme_api/deps.py':
+        `from acme_core.auth import sessoes\nfrom acme_core.db import transacao\nimport acme_core.db\n`,
+      'api/tests/test_deps.py': `def test_x():\n    from acme_api.deps import sessoes\n    assert sessoes\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['api/src/acme_api/deps.py']).toEqual([
+      'core/src/acme_core/auth/sessoes.py',
+      'core/src/acme_core/db.py',
+    ]);
+    expect(result.output.importMap['api/tests/test_deps.py']).toEqual([
+      'api/src/acme_api/deps.py',
+    ]);
+  });
+
+  it('resolves two packages importing each other via setuptools where= and pytest pythonpath', () => {
+    const tree = {
+      'pyproject.toml': `[tool.pytest.ini_options]\npythonpath = ["libs/beta"]\n`,
+      'libs/alpha/setup.cfg': `[metadata]\nname = alpha\n\n[options.packages.find]\nwhere = lib\n`,
+      'libs/alpha/lib/alpha/__init__.py': ``,
+      'libs/alpha/lib/alpha/core.py': `from beta import util\n\ndef run(): pass\n`,
+      'libs/beta/beta/__init__.py': ``,
+      'libs/beta/beta/util.py': `from alpha.core import run\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['libs/alpha/lib/alpha/core.py']).toEqual([
+      'libs/beta/beta/util.py',
+    ]);
+    expect(result.output.importMap['libs/beta/beta/util.py']).toEqual([
+      'libs/alpha/lib/alpha/core.py',
+    ]);
+  });
+
+  it('infers the root of a top-level package only when several files import it', () => {
+    const tree = {
+      'tools/motor/__init__.py': ``,
+      'tools/motor/calc.py': `x = 1\n`,
+      'tools/lonely/__init__.py': ``,
+      'tools/lonely/mod.py': `x = 1\n`,
+      'a/tests/test_a.py': `from motor import calc\nfrom lonely import mod\n`,
+      'b/tests/test_b.py': `import motor.calc\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    // `motor` is imported from two files -> `tools/` becomes a root for it.
+    // `lonely` is imported from one file only -> no inferred root, external.
+    expect(result.output.importMap['a/tests/test_a.py']).toEqual(['tools/motor/calc.py']);
+    expect(result.output.importMap['b/tests/test_b.py']).toEqual(['tools/motor/calc.py']);
+  });
+
+  it('keeps stdlib and third-party names external even when a local folder matches', () => {
+    const tree = {
+      'pyproject.toml': `[project]\nname = "app"\n`,
+      'vendor/json/__init__.py': ``,
+      'vendor/json/decoder.py': `x = 1\n`,
+      'vendor/logging/__init__.py': ``,
+      'lib/pyproject.toml': `[project]\nname = "lib"\n`,
+      'lib/src/json/__init__.py': ``,
+      'lib/src/json/decoder.py': `x = 1\n`,
+      'mcp/pyproject.toml': `[project]\nname = "x-mcp"\n`,
+      'mcp/src/x_mcp/__init__.py': ``,
+      'mcp/src/x_mcp/server.py': `from mcp.server.fastmcp import FastMCP\nimport mcp\n`,
+      'app/a.py': `import json\nfrom json import decoder\nimport logging\n`,
+      'app/b.py': `import json\nfrom json import decoder\nimport logging\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['app/a.py']).toEqual([]);
+    expect(result.output.importMap['app/b.py']).toEqual([]);
+    expect(result.output.importMap['mcp/src/x_mcp/server.py']).toEqual([]);
   });
 });
 
