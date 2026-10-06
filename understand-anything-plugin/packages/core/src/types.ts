@@ -66,6 +66,17 @@ export interface GraphNode {
   figmaMeta?: FigmaMeta;
 }
 
+/**
+ * Where a cross-service link was found (multi-repo workspace graphs, written by
+ * the contract linker). Locations are workspace-namespaced `M/file:line`.
+ */
+export interface CrossServiceEvidence {
+  consumer?: string;
+  provider?: string;
+  via?: string;
+  [key: string]: unknown;
+}
+
 // GraphEdge with rich relationship modeling
 export interface GraphEdge {
   source: string;
@@ -74,6 +85,13 @@ export interface GraphEdge {
   direction: "forward" | "backward" | "bidirectional";
   description?: string;
   weight: number; // 0-1
+  /** Contract-linker edges between two workspace members (see docs/multi-repo-workspace.md). */
+  crossService?: boolean;
+  /** Linker confidence (0-1] of a cross-service link. */
+  confidence?: number;
+  evidence?: CrossServiceEvidence;
+  /** Number of call sites folded into this cross-service `calls` edge. */
+  callSites?: number;
 }
 
 // Layer (logical grouping)

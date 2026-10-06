@@ -2,6 +2,8 @@ import { useEffect, useRef } from "react";
 import { useDashboardStore, ALL_NODE_TYPES, ALL_COMPLEXITIES, ALL_EDGE_CATEGORIES } from "../store";
 import type { NodeType, Complexity, EdgeCategory } from "../store";
 import { useI18n } from "../contexts/I18nContext";
+import { getWorkspaceMemberNames } from "@understand-anything/core/workspace";
+import { memberColor } from "../utils/workspace";
 
 export default function FilterPanel() {
   const graph = useDashboardStore((s) => s.graph);
@@ -11,7 +13,10 @@ export default function FilterPanel() {
   const hasActiveFilters = useDashboardStore((s) => s.hasActiveFilters);
   const filterPanelOpen = useDashboardStore((s) => s.filterPanelOpen);
   const toggleFilterPanel = useDashboardStore((s) => s.toggleFilterPanel);
+  const hiddenMembers = useDashboardStore((s) => s.hiddenMembers);
+  const toggleMemberVisibility = useDashboardStore((s) => s.toggleMemberVisibility);
   const { t } = useI18n();
+  const members = getWorkspaceMemberNames(graph);
 
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -105,6 +110,32 @@ export default function FilterPanel() {
       {filterPanelOpen && (
         <div className="absolute right-0 top-full mt-2 w-72 glass rounded-lg shadow-xl overflow-hidden animate-fade-slide-in z-50">
           <div className="p-4 space-y-4">
+            {/* Workspace services (multi-repo graphs only) */}
+            {members.length > 0 && (
+              <div>
+                <h3 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2">
+                  {t.services.filterTitle}
+                </h3>
+                <div className="space-y-1.5">
+                  {members.map((member) => (
+                    <label
+                      key={member}
+                      className="flex items-center gap-2 cursor-pointer hover:bg-elevated/50 rounded px-2 py-1 transition-colors"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!hiddenMembers.has(member)}
+                        onChange={() => toggleMemberVisibility(member)}
+                        className="w-3.5 h-3.5 rounded border-border-subtle bg-elevated checked:bg-gold checked:border-gold focus:ring-0 focus:ring-offset-0 cursor-pointer"
+                      />
+                      <div className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: memberColor(member) }} />
+                      <span className="text-sm text-text-primary">{member}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Node Types */}
             <div>
               <h3 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2">

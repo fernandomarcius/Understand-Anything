@@ -1,5 +1,45 @@
 import { useDashboardStore } from "../store";
 import { useI18n } from "../contexts/I18nContext";
+import { getWorkspaceMemberNames } from "@understand-anything/core/workspace";
+import { fillTemplate, memberColor } from "../utils/workspace";
+
+/** Workspace member filter state: back to the services view, show all members. */
+function MemberFilterChip() {
+  const graph = useDashboardStore((s) => s.graph);
+  const hiddenMembers = useDashboardStore((s) => s.hiddenMembers);
+  const showAllMembers = useDashboardStore((s) => s.showAllMembers);
+  const setViewMode = useDashboardStore((s) => s.setViewMode);
+  const { t } = useI18n();
+
+  if (hiddenMembers.size === 0) return null;
+  const visible = getWorkspaceMemberNames(graph).filter((m) => !hiddenMembers.has(m));
+
+  return (
+    <div className="flex items-center gap-2 px-3 py-2 rounded-full bg-elevated border border-border-subtle text-xs shadow-lg">
+      <button
+        type="button"
+        onClick={() => setViewMode("services")}
+        className="font-semibold uppercase tracking-wider text-gold hover:text-gold-bright transition-colors"
+      >
+        ← {t.services.view}
+      </button>
+      <span className="text-text-muted">│</span>
+      <span className="flex items-center gap-1.5 text-text-secondary">
+        {visible.map((m) => (
+          <span key={m} className="w-2 h-2 rounded-full" style={{ backgroundColor: memberColor(m) }} />
+        ))}
+        {fillTemplate(t.services.showing, { names: visible.join(", ") || "—" })}
+      </span>
+      <button
+        type="button"
+        onClick={showAllMembers}
+        className="text-text-muted hover:text-gold transition-colors"
+      >
+        {t.services.showAll} &times;
+      </button>
+    </div>
+  );
+}
 
 export default function Breadcrumb() {
   const navigationLevel = useDashboardStore((s) => s.navigationLevel);
@@ -35,6 +75,8 @@ export default function Breadcrumb() {
           </span>
         </div>
       )}
+
+      <MemberFilterChip />
     </div>
   );
 }

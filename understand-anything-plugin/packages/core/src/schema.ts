@@ -446,6 +446,20 @@ export const GraphEdgeSchema = z.object({
   direction: z.enum(["forward", "backward", "bidirectional"]),
   description: z.string().optional(),
   weight: z.number().min(0).max(1),
+  // Cross-service metadata written by the workspace contract linker. A
+  // malformed value is discarded (`catch`) instead of dropping the edge.
+  crossService: z.boolean().optional().catch(undefined),
+  confidence: z.number().optional().catch(undefined),
+  evidence: z
+    .object({
+      consumer: z.string().optional().catch(undefined),
+      provider: z.string().optional().catch(undefined),
+      via: z.string().optional().catch(undefined),
+    })
+    .passthrough()
+    .optional()
+    .catch(undefined),
+  callSites: z.number().int().nonnegative().optional().catch(undefined),
 });
 
 export const LayerSchema = z.object({

@@ -133,3 +133,26 @@ export {
   type IgnoreFilter,
 } from "./ignore-filter.js";
 export { generateStarterIgnoreFile } from "./ignore-generator.js";
+export {
+  WORKSPACE_FILE_LEVEL_TYPES,
+  getWorkspaceMemberNames,
+  memberOfId,
+  memberOfNode,
+  isSharedContractNode,
+  namespaceChangedFiles,
+  buildServiceGraph,
+  getEndpointConsumers,
+  buildCrossServiceImpact,
+  formatCrossServiceImpact,
+  buildWorkspaceDiffOverlay,
+  type ServiceSummary,
+  type ServiceLink,
+  type ServiceGraph,
+  type CrossServiceConsumer,
+  type AffectedEndpoint,
+  type ContractTouch,
+  type TouchedContract,
+  type OutboundCall,
+  type CrossServiceImpact,
+  type WorkspaceDiffOverlay,
+} from "./workspace.js";

@@ -6,6 +6,7 @@ export default function DiffToggle() {
   const toggleDiffMode = useDashboardStore((s) => s.toggleDiffMode);
   const changedNodeIds = useDashboardStore((s) => s.changedNodeIds);
   const affectedNodeIds = useDashboardStore((s) => s.affectedNodeIds);
+  const crossServiceNodeIds = useDashboardStore((s) => s.crossServiceNodeIds);
   const { t } = useI18n();
 
   const hasDiff = changedNodeIds.size > 0;
@@ -59,6 +60,20 @@ export default function DiffToggle() {
               </span>
             </span>
           </div>
+          {crossServiceNodeIds.size > 0 && (
+            <div className="flex items-center gap-1">
+              <span
+                className="inline-block w-2 h-2 rounded-full border-2"
+                style={{ borderColor: "var(--color-diff-affected)" }}
+              />
+              <span className="text-text-secondary text-[11px]">
+                {t.services.otherServices}
+                <span className="text-text-muted ml-0.5">
+                  ({crossServiceNodeIds.size})
+                </span>
+              </span>
+            </div>
+          )}
         </div>
       )}
     </div>

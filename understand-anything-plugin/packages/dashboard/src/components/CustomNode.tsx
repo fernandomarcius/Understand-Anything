@@ -83,6 +83,8 @@ export interface CustomNodeData extends Record<string, unknown> {
   isDiffChanged: boolean;
   isDiffAffected: boolean;
   isDiffFaded: boolean;
+  /** Workspace diff: consumer in another service of a changed contract. */
+  isDiffCrossService?: boolean;
   isNeighbor: boolean;
   isSelectionFaded: boolean;
   onNodeClick?: (nodeId: string) => void;
@@ -127,7 +129,9 @@ function CustomNodeComponent({
   if (data.isDiffChanged) {
     extraClass += " ring-2 ring-[var(--color-diff-changed)] diff-changed-glow";
   } else if (data.isDiffAffected) {
-    extraClass += " ring-1 ring-[var(--color-diff-affected)] diff-affected-glow";
+    extraClass += data.isDiffCrossService
+      ? " ring-2 ring-[var(--color-diff-affected)] diff-affected-glow"
+      : " ring-1 ring-[var(--color-diff-affected)] diff-affected-glow";
   } else if (data.isDiffFaded) {
     extraClass += " diff-faded";
   }
@@ -166,6 +170,15 @@ function CustomNodeComponent({
             {data.nodeType}
           </span>
           <div className="flex items-center gap-1.5">
+            {data.isDiffCrossService && (
+              <span
+                className="text-[9px] font-semibold text-[var(--color-diff-affected)]"
+                title={t.services.otherServices}
+                aria-label={t.services.otherServices}
+              >
+                ⇄
+              </span>
+            )}
             <span className={`text-[9px] font-mono ${complexityColor}`}>
               {data.complexity}
             </span>

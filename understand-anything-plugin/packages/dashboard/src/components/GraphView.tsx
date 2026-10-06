@@ -53,6 +53,8 @@ import {
 import { deriveContainers } from "../utils/containers";
 import type { DerivedContainer } from "../utils/containers";
 import { computeLayerStats } from "../utils/layerStats";
+import { getWorkspaceMemberNames } from "@understand-anything/core/workspace";
+import { isNodeInVisibleMembers } from "../utils/workspace";
 
 const nodeTypes = {
   custom: CustomNode,
@@ -242,6 +244,7 @@ function useOverviewGraph() {
   const nodeIdToLayerId = useDashboardStore((s) => s.nodeIdToLayerId);
   const searchResults = useDashboardStore((s) => s.searchResults);
   const drillIntoLayer = useDashboardStore((s) => s.drillIntoLayer);
+  const hiddenMembers = useDashboardStore((s) => s.hiddenMembers);
 
   // Build cluster nodes / flow edges / dims synchronously; only the layout
   // call itself is async, so we memo the structural pieces and run ELK in an
@@ -250,7 +253,15 @@ function useOverviewGraph() {
     if (!graph) {
       return null;
     }
-    const layers = graph.layers ?? [];
+    const allLayers = graph.layers ?? [];
+    // Workspace member filter: layers are namespaced `layer:<member>/...`.
+    // Keep the original index so a layer's color does not shift when
+    // other members are hidden.
+    const memberSet = new Set(getWorkspaceMemberNames(graph));
+    const layerIndex = new Map(allLayers.map((l, i) => [l.id, i]));
+    const layers = hiddenMembers.size > 0
+      ? allLayers.filter((l) => isNodeInVisibleMembers(l.id, memberSet, hiddenMembers))
+      : allLayers;
     if (layers.length === 0) {
       return null;
     }
@@ -272,7 +283,7 @@ function useOverviewGraph() {
     // `computeLayerStats`, which iterates `layer.nodeIds` against the
     // `nodesById` index — O(K) per layer instead of the previous
     // O(N) Array.filter that ran `layer.nodeIds.includes(n.id)` (#102).
-    const clusterNodes: LayerClusterFlowNode[] = layers.map((layer, i) => {
+    const clusterNodes: LayerClusterFlowNode[] = layers.map((layer) => {
       const { aggregateComplexity } = computeLayerStats(layer, nodesById);
 
       return {
@@ -285,7 +296,7 @@ function useOverviewGraph() {
           layerDescription: layer.description,
           fileCount: layer.nodeIds.length,
           aggregateComplexity,
-          layerColorIndex: i,
+          layerColorIndex: layerIndex.get(layer.id) ?? 0,
           searchMatchCount: searchMatchByLayer.get(layer.id),
           onDrillIn: drillIntoLayer,
         },
@@ -293,7 +304,9 @@ function useOverviewGraph() {
     });
 
     // Aggregate edges between layers
-    const aggregated = aggregateLayerEdges(graph);
+    const aggregated = aggregateLayerEdges(
+      layers === allLayers ? graph : { ...graph, layers },
+    );
     const flowEdges: Edge[] = aggregated.map((agg, i) => ({
       id: `le-${i}`,
       source: agg.sourceLayerId,
@@ -312,7 +325,7 @@ function useOverviewGraph() {
     }
 
     return { clusterNodes, flowEdges, dims };
-  }, [graph, nodesById, nodeIdToLayerId, searchResults, drillIntoLayer]);
+  }, [graph, nodesById, nodeIdToLayerId, searchResults, drillIntoLayer, hiddenMembers]);
 
   const [overview, setOverview] = useState<{ nodes: Node[]; edges: Edge[] }>({
     nodes: [],
@@ -401,11 +414,13 @@ function useLayerDetailTopology(): LayerDetailTopology & {
   const diffMode = useDashboardStore((s) => s.diffMode);
   const changedNodeIds = useDashboardStore((s) => s.changedNodeIds);
   const affectedNodeIds = useDashboardStore((s) => s.affectedNodeIds);
+  const crossServiceNodeIds = useDashboardStore((s) => s.crossServiceNodeIds);
   const focusNodeId = useDashboardStore((s) => s.focusNodeId);
   const nodeTypeFilters = useDashboardStore((s) => s.nodeTypeFilters);
   const drillIntoLayer = useDashboardStore((s) => s.drillIntoLayer);
   const detailLevel = useDashboardStore((s) => s.detailLevel);
   const showFunctionsInClassView = useDashboardStore((s) => s.showFunctionsInClassView);
+  const hiddenMembers = useDashboardStore((s) => s.hiddenMembers);
 
   const handleNodeSelect = useCallback(
     (nodeId: string) => {
@@ -455,9 +470,11 @@ function useLayerDetailTopology(): LayerDetailTopology & {
     const subFileTypes = new Set(["function", "class"]);
     const allVisibleTypes = STRUCTURAL_VISIBLE_TYPES;
 
+    const memberSet = new Set(getWorkspaceMemberNames(graph));
     let filteredGraphNodes = graph.nodes.filter((n) => {
       if (!expandedLayerNodeIds.has(n.id)) return false;
       if (!allVisibleTypes.has(n.type)) return false;
+      if (!isNodeInVisibleMembers(n.id, memberSet, hiddenMembers)) return false;
       if (persona === "non-technical" && subFileTypes.has(n.type)) return false;
       return true;
     });
@@ -576,6 +593,7 @@ function useLayerDetailTopology(): LayerDetailTopology & {
           isDiffChanged: diffMode && changedNodeIds.has(node.id),
           isDiffAffected: diffMode && affectedNodeIds.has(node.id),
           isDiffFaded: diffMode && !changedNodeIds.has(node.id) && !affectedNodeIds.has(node.id),
+          isDiffCrossService: diffMode && crossServiceNodeIds.has(node.id),
           isNeighbor: false,
           isSelectionFaded: false,
           onNodeClick: handleNodeSelect,
@@ -607,7 +625,9 @@ function useLayerDetailTopology(): LayerDetailTopology & {
     });
 
     // Portal nodes for connected external layers (unchanged)
-    const portals = computePortals(graph, activeLayerId);
+    const portals = computePortals(graph, activeLayerId).filter((p) =>
+      isNodeInVisibleMembers(p.layerId, memberSet, hiddenMembers),
+    );
     const layerIndexMap = new Map(graph.layers.map((l, i) => [l.id, i]));
 
     const portalNodes: PortalFlowNode[] = portals.map((portal) => ({
@@ -667,11 +687,13 @@ function useLayerDetailTopology(): LayerDetailTopology & {
     diffMode,
     changedNodeIds,
     affectedNodeIds,
+    crossServiceNodeIds,
     focusNodeId,
     nodeTypeFilters,
     drillIntoLayer,
     detailLevel,
     showFunctionsInClassView,
+    hiddenMembers,
     handleNodeSelect,
     handleContainerToggle,
   ]);
@@ -935,6 +957,7 @@ function buildCustomFlowNode(
     diffMode: boolean;
     changedNodeIds: Set<string>;
     affectedNodeIds: Set<string>;
+    crossServiceNodeIds: Set<string>;
     onNodeClick: (nodeId: string) => void;
   },
 ): CustomFlowNode {
@@ -958,6 +981,7 @@ function buildCustomFlowNode(
         opts.diffMode &&
         !opts.changedNodeIds.has(node.id) &&
         !opts.affectedNodeIds.has(node.id),
+      isDiffCrossService: opts.diffMode && opts.crossServiceNodeIds.has(node.id),
       isNeighbor: false,
       isSelectionFaded: false,
       onNodeClick: opts.onNodeClick,
@@ -988,6 +1012,7 @@ function useLayerDetailGraph() {
   const diffMode = useDashboardStore((s) => s.diffMode);
   const changedNodeIds = useDashboardStore((s) => s.changedNodeIds);
   const affectedNodeIds = useDashboardStore((s) => s.affectedNodeIds);
+  const crossServiceNodeIds = useDashboardStore((s) => s.crossServiceNodeIds);
   const focusNodeId = useDashboardStore((s) => s.focusNodeId);
   const selectNode = useDashboardStore((s) => s.selectNode);
 
@@ -1017,6 +1042,7 @@ function useLayerDetailGraph() {
           diffMode,
           changedNodeIds,
           affectedNodeIds,
+          crossServiceNodeIds,
           onNodeClick: handleNodeSelect,
         });
         out.push({
@@ -1036,6 +1062,7 @@ function useLayerDetailGraph() {
     diffMode,
     changedNodeIds,
     affectedNodeIds,
+    crossServiceNodeIds,
     handleNodeSelect,
   ]);
 

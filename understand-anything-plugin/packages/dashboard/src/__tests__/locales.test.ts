@@ -55,3 +55,17 @@ describe("stalenessBanner placeholders", () => {
     }
   });
 });
+
+describe("services (workspace) strings", () => {
+  it("exist in every locale with the same {placeholders} as English", () => {
+    const placeholders = (text: string) => (text.match(/\{[a-z]+\}/g) ?? []).sort();
+    for (const [key, locale] of Object.entries(locales)) {
+      expect(Object.keys(locale.services).sort(), key).toEqual(Object.keys(locales.en.services).sort());
+      for (const [k, text] of Object.entries(locales.en.services)) {
+        const value = locale.services[k as keyof typeof locale.services];
+        expect(value.length, `${key}.services.${k}`).toBeGreaterThan(0);
+        expect(placeholders(value), `${key}.services.${k}`).toEqual(placeholders(text));
+      }
+    }
+  });
+});
