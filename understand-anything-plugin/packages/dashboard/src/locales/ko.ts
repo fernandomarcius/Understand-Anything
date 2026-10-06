@@ -162,6 +162,14 @@ export const ko = {
     dropped: "삭제됨",
     fatal: "치명적",
   },
+  stalenessBanner: {
+    workspaceStaleTitle: "워크스페이스 그래프가 오래되었을 수 있습니다",
+    workspaceStaleSummary: "{total}개 중 {count}개 멤버가 분석 이후 변경되었습니다: {names}.",
+    workspaceUnknownTitle: "워크스페이스 최신 상태를 완전히 확인할 수 없습니다",
+    workspaceUnknownSummary: "{total}개 중 {count}개 멤버를 확인할 수 없습니다(Git 저장소가 아니거나 Git을 사용할 수 없음): {names}.",
+    workspaceAction: "영향 분석이나 온보딩 답변에 의존하기 전에 /understand --workspace 를 실행해 갱신하세요.",
+    workspaceUnknownAction: "Git 밖의 멤버는 확인할 수 없으며 오래된 것으로 보고되지 않습니다.",
+  },
   themePicker: {
     changeTheme: "테마 변경",
     theme: "테마",

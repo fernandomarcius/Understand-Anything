@@ -162,6 +162,14 @@ export const en = {
     dropped: "Dropped",
     fatal: "Fatal",
   },
+  stalenessBanner: {
+    workspaceStaleTitle: "Workspace graph may be stale",
+    workspaceStaleSummary: "{count} of {total} members changed since analysis: {names}.",
+    workspaceUnknownTitle: "Workspace freshness could not be fully verified",
+    workspaceUnknownSummary: "Could not verify {count} of {total} members (not a Git repository or Git unavailable): {names}.",
+    workspaceAction: "Run /understand --workspace to refresh them before relying on impact or onboarding answers.",
+    workspaceUnknownAction: "Members outside Git cannot be checked; they are never reported as stale.",
+  },
   themePicker: {
     changeTheme: "Change theme",
     theme: "Theme",

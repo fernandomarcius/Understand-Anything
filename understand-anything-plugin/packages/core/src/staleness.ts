@@ -1,5 +1,12 @@
 import { execFile, execFileSync } from "child_process";
-import type { KnowledgeGraph, GraphNode, GraphEdge } from "./types.js";
+import { statSync } from "fs";
+import { resolve as resolvePath } from "path";
+import type {
+  KnowledgeGraph,
+  GraphNode,
+  GraphEdge,
+  ProjectMeta,
+} from "./types.js";
 
 export interface StalenessResult {
   stale: boolean;
@@ -458,6 +465,121 @@ export async function getGraphFreshness(
 ): Promise<GraphFreshnessResult> {
   const results = await getGraphFreshnessBatch(projectDir, { graph: input });
   return results.graph;
+}
+
+/*
+ * ── Workspace freshness contract (multi-repo workspace graphs) ──────────────
+ *
+ * Server side (dashboard vite.config.ts and viewer bin/viewer.mjs):
+ *   const workspace = await getWorkspaceFreshness(dirContainingUaDir, graph);
+ *   // graph = parsed knowledge-graph.json (only `project.workspace` is read)
+ *   // workspaceRoot = the directory that contains `.ua/` (member paths are
+ *   // relative to it, exactly as written in ua-workspace.json).
+ *   if (workspace) payload.workspace = workspace;   // GET /staleness.json
+ *
+ * `/staleness.json` payload becomes:
+ *   {
+ *     graphs: { knowledge: GraphFreshnessResult; domain?: GraphFreshnessResult },
+ *     workspace?: WorkspaceFreshnessReport          // only for workspace graphs
+ *   }
+ * `graphs.knowledge` stays mandatory (keep computing it as today; for a
+ * workspace root it is usually "unknown"). When `workspace` is present the
+ * dashboard banner ignores `graphs` and reports per member instead, listing
+ * the names of stale members. Members are returned in manifest order:
+ *   { name, path, status: "fresh",   graphCommitHash, headCommitHash }
+ *   { name, path, status: "stale",   graphCommitHash, headCommitHash }
+ *   { name, path, status: "unknown", graphCommitHash, reason }
+ * reason ∈ "missing-graph-commit" | "member-path-missing"
+ *        | "git-head-unavailable" (not a Git repo / no HEAD) | "git-command-timeout".
+ * A member that is not a Git repository is "unknown", never "stale".
+ * Returns null when the graph has no `project.workspace`.
+ */
+
+export type WorkspaceMemberUnknownReason =
+  | "missing-graph-commit"
+  | "member-path-missing"
+  | "git-head-unavailable"
+  | "git-command-timeout";
+
+export type WorkspaceMemberFreshness =
+  | {
+      name: string;
+      path: string;
+      status: "fresh" | "stale";
+      graphCommitHash: string;
+      headCommitHash: string;
+    }
+  | {
+      name: string;
+      path: string;
+      status: "unknown";
+      reason: WorkspaceMemberUnknownReason;
+      graphCommitHash: string;
+    };
+
+export interface WorkspaceFreshnessReport {
+  name: string;
+  members: WorkspaceMemberFreshness[];
+}
+
+function isDirectory(dir: string): boolean {
+  try {
+    return statSync(dir).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Per-member freshness of a merged workspace graph: `git rev-parse HEAD` in
+ * `<workspaceRoot>/<member.path>` compared with the member's recorded
+ * `gitCommitHash`. See the contract block above.
+ */
+export async function getWorkspaceFreshness(
+  workspaceRoot: string,
+  graph: { project: Pick<ProjectMeta, "workspace"> },
+): Promise<WorkspaceFreshnessReport | null> {
+  const workspace = graph.project.workspace;
+  if (!workspace) return null;
+
+  const members = await Promise.all(
+    workspace.members.map(async (member): Promise<WorkspaceMemberFreshness> => {
+      const base = { name: member.name, path: member.path };
+      const graphCommitHash = member.gitCommitHash.trim();
+      const unknown = (reason: WorkspaceMemberUnknownReason) => ({
+        ...base,
+        status: "unknown" as const,
+        reason,
+        graphCommitHash: member.gitCommitHash,
+      });
+
+      if (!graphCommitHash) return unknown("missing-graph-commit");
+      const memberDir = resolvePath(workspaceRoot, member.path);
+      if (!isDirectory(memberDir)) return unknown("member-path-missing");
+
+      let headCommitHash: string;
+      try {
+        headCommitHash = parseScalar(
+          await runGit(memberDir, ["rev-parse", "HEAD"]),
+        );
+      } catch (error) {
+        return unknown(
+          error instanceof GitCommandError && error.timedOut
+            ? "git-command-timeout"
+            : "git-head-unavailable",
+        );
+      }
+
+      return {
+        ...base,
+        status: headCommitHash === graphCommitHash ? "fresh" : "stale",
+        graphCommitHash,
+        headCommitHash,
+      };
+    }),
+  );
+
+  return { name: workspace.name, members };
 }
 
 /**

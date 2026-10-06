@@ -162,6 +162,14 @@ export const ja = {
     dropped: "削除済み",
     fatal: "致命的",
   },
+  stalenessBanner: {
+    workspaceStaleTitle: "ワークスペースのグラフが古くなっている可能性があります",
+    workspaceStaleSummary: "{total} 個中 {count} 個のメンバーが解析後に変更されました: {names}。",
+    workspaceUnknownTitle: "ワークスペースの鮮度を完全には確認できませんでした",
+    workspaceUnknownSummary: "{total} 個中 {count} 個のメンバーを確認できませんでした（Git リポジトリではないか、Git が利用できません）: {names}。",
+    workspaceAction: "影響分析やオンボーディングの回答に頼る前に /understand --workspace を実行して更新してください。",
+    workspaceUnknownAction: "Git 管理外のメンバーは確認できず、古いと報告されることはありません。",
+  },
   themePicker: {
     changeTheme: "テーマ変更",
     theme: "テーマ",

@@ -93,6 +93,23 @@ export interface TourStep {
   languageLesson?: string;
 }
 
+// Workspace metadata (multi-repo workspace graphs only)
+export interface WorkspaceMemberMeta {
+  name: string;
+  /** Member path as written in ua-workspace.json (relative to the workspace root). */
+  path: string;
+  /** Member graph's project.gitCommitHash at merge time. */
+  gitCommitHash: string;
+  analyzedAt: string;
+  nodes: number;
+  edges: number;
+}
+
+export interface WorkspaceMeta {
+  name: string;
+  members: WorkspaceMemberMeta[];
+}
+
 // ProjectMeta
 export interface ProjectMeta {
   name: string;
@@ -101,6 +118,8 @@ export interface ProjectMeta {
   description: string;
   analyzedAt: string;
   gitCommitHash: string;
+  /** Present only when the graph is a merged multi-repo workspace. */
+  workspace?: WorkspaceMeta;
 }
 
 // Root KnowledgeGraph

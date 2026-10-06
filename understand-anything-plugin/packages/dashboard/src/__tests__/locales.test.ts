@@ -42,3 +42,16 @@ describe("locales", () => {
     expect(getLocale("vi")).toBe(locales.vi);
   });
 });
+
+describe("stalenessBanner placeholders", () => {
+  it("keeps the same {placeholders} as English in every locale", () => {
+    const placeholders = (text: string) => (text.match(/\{[a-z]+\}/g) ?? []).sort();
+    for (const locale of Object.values(locales)) {
+      for (const [key, text] of Object.entries(locales.en.stalenessBanner)) {
+        expect(placeholders(locale.stalenessBanner[key as keyof typeof locale.stalenessBanner])).toEqual(
+          placeholders(text),
+        );
+      }
+    }
+  });
+});

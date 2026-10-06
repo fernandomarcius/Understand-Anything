@@ -34,6 +34,7 @@ export {
   getChangedFiles,
   getGraphFreshness,
   getGraphFreshnessBatch,
+  getWorkspaceFreshness,
   isStale,
   mergeGraphUpdate,
   type GraphFreshnessInput,
@@ -41,6 +42,9 @@ export {
   type GraphFreshnessResult,
   type GraphFreshnessUnknownReason,
   type StalenessResult,
+  type WorkspaceFreshnessReport,
+  type WorkspaceMemberFreshness,
+  type WorkspaceMemberUnknownReason,
 } from "./staleness.js";
 export {
   detectLayers,

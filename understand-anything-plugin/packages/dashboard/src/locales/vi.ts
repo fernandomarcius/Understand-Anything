@@ -162,6 +162,14 @@ export const vi = {
     dropped: "Đã loại bỏ",
     fatal: "Nghiêm trọng",
   },
+  stalenessBanner: {
+    workspaceStaleTitle: "Đồ thị workspace có thể đã cũ",
+    workspaceStaleSummary: "{count}/{total} thành viên đã thay đổi kể từ lần phân tích: {names}.",
+    workspaceUnknownTitle: "Không thể xác minh đầy đủ độ mới của workspace",
+    workspaceUnknownSummary: "Không thể xác minh {count}/{total} thành viên (không phải kho Git hoặc Git không khả dụng): {names}.",
+    workspaceAction: "Chạy /understand --workspace để làm mới trước khi dựa vào câu trả lời về tác động hoặc onboarding.",
+    workspaceUnknownAction: "Thành viên ngoài Git không thể kiểm tra; chúng không bao giờ bị báo là cũ.",
+  },
   themePicker: {
     changeTheme: "Đổi giao diện",
     theme: "Giao diện",

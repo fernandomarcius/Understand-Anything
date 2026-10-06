@@ -162,6 +162,14 @@ export const ru = {
     dropped: "Отброшено",
     fatal: "Критично",
   },
+  stalenessBanner: {
+    workspaceStaleTitle: "Граф рабочего пространства может быть устаревшим",
+    workspaceStaleSummary: "Изменилось участников после анализа: {count} из {total}: {names}.",
+    workspaceUnknownTitle: "Не удалось полностью проверить актуальность рабочего пространства",
+    workspaceUnknownSummary: "Не удалось проверить участников: {count} из {total} (не Git-репозиторий или Git недоступен): {names}.",
+    workspaceAction: "Запустите /understand --workspace, чтобы обновить их, прежде чем полагаться на анализ влияния или онбординг.",
+    workspaceUnknownAction: "Участники вне Git не проверяются и никогда не помечаются как устаревшие.",
+  },
   themePicker: {
     changeTheme: "Сменить тему",
     theme: "Тема",

@@ -67,6 +67,46 @@ function writeGraph(
   );
 }
 
+function initMemberRepo(relativeDir: string): string {
+  const dir = path.join(tempProject, ...relativeDir.split("/"));
+  fs.mkdirSync(dir, { recursive: true });
+  const run = (...args: string[]) =>
+    execFileSync("git", args, { cwd: dir, encoding: "utf8" }).trim();
+  run("init");
+  run("config", "user.email", "dashboard-tests@example.com");
+  run("config", "user.name", "Dashboard Tests");
+  fs.writeFileSync(path.join(dir, "main.ts"), "export const v = 1;\n", "utf8");
+  run("add", "--all");
+  run("commit", "-m", "member baseline");
+  return run("rev-parse", "HEAD");
+}
+
+function writeWorkspaceGraph(
+  members: Array<{ name: string; path: string; gitCommitHash: string }>,
+): void {
+  fs.writeFileSync(
+    path.join(graphDirectory(".ua"), "knowledge-graph.json"),
+    JSON.stringify({
+      project: {
+        gitCommitHash: "ws:0000",
+        analyzedAt: "2026-07-10T00:00:00.000Z",
+        workspace: {
+          name: "fixture-ws",
+          members: members.map((member) => ({
+            ...member,
+            analyzedAt: "2026-07-10T00:00:00.000Z",
+            nodes: 1,
+            edges: 0,
+          })),
+        },
+      },
+      nodes: [],
+      edges: [],
+    }),
+    "utf8",
+  );
+}
+
 async function startDashboardServer(accessToken: string): Promise<string> {
   const middleware = createDashboardDataMiddleware(accessToken);
   const server = createServer((req, res) => {
@@ -223,6 +263,71 @@ describe(
           },
         },
       });
+    });
+
+    it("reports per-member freshness for a workspace graph", async () => {
+      const freshHead = initMemberRepo("services/brain");
+      const staleRecorded = initMemberRepo("services/motor");
+      fs.writeFileSync(
+        path.join(tempProject, "services", "motor", "main.ts"),
+        "export const v = 2;\n",
+        "utf8",
+      );
+      execFileSync("git", ["commit", "-am", "member change"], {
+        cwd: path.join(tempProject, "services", "motor"),
+      });
+      const motorHead = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: path.join(tempProject, "services", "motor"),
+        encoding: "utf8",
+      }).trim();
+      writeWorkspaceGraph([
+        { name: "brain", path: "services/brain", gitCommitHash: freshHead },
+        { name: "motor", path: "services/motor", gitCommitHash: staleRecorded },
+      ]);
+      const baseUrl = await startDashboardServer("test-token");
+
+      const response = await requestJson(
+        baseUrl,
+        "/staleness.json?token=test-token",
+      );
+
+      expect(response.status).toBe(200);
+      expect(isDashboardFreshnessReport(response.body)).toBe(true);
+      expect(response.body).toMatchObject({
+        graphs: { knowledge: { status: expect.any(String) } },
+        workspace: {
+          name: "fixture-ws",
+          members: [
+            {
+              name: "brain",
+              path: "services/brain",
+              status: "fresh",
+              graphCommitHash: freshHead,
+              headCommitHash: freshHead,
+            },
+            {
+              name: "motor",
+              path: "services/motor",
+              status: "stale",
+              graphCommitHash: staleRecorded,
+              headCommitHash: motorHead,
+            },
+          ],
+        },
+      });
+    });
+
+    it("omits the workspace block for a non-workspace graph", async () => {
+      writeGraph("knowledge-graph.json", baselineCommit);
+      const baseUrl = await startDashboardServer("test-token");
+
+      const response = await requestJson(
+        baseUrl,
+        "/staleness.json?token=test-token",
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.body).not.toHaveProperty("workspace");
     });
 
     it("returns 404 when the required knowledge graph is missing", async () => {

@@ -162,6 +162,14 @@ export const zhTW = {
     dropped: "已捨棄",
     fatal: "致命錯誤",
   },
+  stalenessBanner: {
+    workspaceStaleTitle: "工作區圖譜可能已過時",
+    workspaceStaleSummary: "{total} 個成員中有 {count} 個在分析後發生變更：{names}。",
+    workspaceUnknownTitle: "無法完整驗證工作區的新鮮度",
+    workspaceUnknownSummary: "無法驗證 {total} 個成員中的 {count} 個（不是 Git 儲存庫或無法使用 Git）：{names}。",
+    workspaceAction: "在依賴影響分析或導覽答案之前，請執行 /understand --workspace 重新整理。",
+    workspaceUnknownAction: "Git 之外的成員無法檢查，且永遠不會被標記為過時。",
+  },
   themePicker: {
     changeTheme: "變更主題",
     theme: "主題",

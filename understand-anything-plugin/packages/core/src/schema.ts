@@ -463,6 +463,20 @@ export const TourStepSchema = z.object({
   languageLesson: z.string().optional(),
 });
 
+export const WorkspaceMemberMetaSchema = z.object({
+  name: z.string(),
+  path: z.string(),
+  gitCommitHash: z.string(),
+  analyzedAt: z.string(),
+  nodes: z.number().int().nonnegative(),
+  edges: z.number().int().nonnegative(),
+});
+
+export const WorkspaceMetaSchema = z.object({
+  name: z.string(),
+  members: z.array(WorkspaceMemberMetaSchema),
+});
+
 export const ProjectMetaSchema = z.object({
   name: z.string(),
   languages: z.array(z.string()),
@@ -470,6 +484,8 @@ export const ProjectMetaSchema = z.object({
   description: z.string(),
   analyzedAt: z.string(),
   gitCommitHash: z.string(),
+  // Present only on multi-repo workspace graphs (see docs/multi-repo-workspace.md).
+  workspace: WorkspaceMetaSchema.optional(),
 });
 
 export const KnowledgeGraphSchema = z.object({

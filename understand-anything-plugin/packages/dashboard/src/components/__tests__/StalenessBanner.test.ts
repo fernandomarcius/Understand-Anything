@@ -4,6 +4,7 @@ import type {
   GraphFreshnessResult,
 } from "../../freshness";
 import { buildFreshnessBanner } from "../StalenessBanner";
+import { locales } from "../../locales";
 
 const fresh: GraphFreshnessResult = {
   status: "fresh",
@@ -165,5 +166,92 @@ describe("buildFreshnessBanner", () => {
       summary: "The dashboard could not refresh graph freshness data.",
       changedFiles: [],
     });
+  });
+});
+
+describe("buildFreshnessBanner for workspace graphs", () => {
+  const unknownKnowledge: GraphFreshnessResult = {
+    status: "unknown",
+    reason: "git-head-unavailable",
+  };
+
+  function workspaceReport(
+    members: NonNullable<DashboardFreshnessReport["workspace"]>["members"],
+  ): DashboardFreshnessReport {
+    return { graphs: { knowledge: unknownKnowledge }, workspace: { name: "cloudbi", members } };
+  }
+
+  const freshMember = (name: string) => ({
+    name,
+    path: `../${name}`,
+    status: "fresh" as const,
+    graphCommitHash: "a".repeat(40),
+    headCommitHash: "a".repeat(40),
+  });
+  const staleMember = (name: string) => ({
+    name,
+    path: `../${name}`,
+    status: "stale" as const,
+    graphCommitHash: "a".repeat(40),
+    headCommitHash: "b".repeat(40),
+  });
+  const unknownMember = (name: string) => ({
+    name,
+    path: `../${name}`,
+    status: "unknown" as const,
+    reason: "git-head-unavailable" as const,
+    graphCommitHash: "c".repeat(40),
+  });
+
+  it("shows no banner when every member is fresh, ignoring the root-level graph result", () => {
+    expect(
+      buildFreshnessBanner(workspaceReport([freshMember("brain"), freshMember("motor")])),
+    ).toBeNull();
+  });
+
+  it("lists the stale member names", () => {
+    const banner = buildFreshnessBanner(
+      workspaceReport([freshMember("brain"), staleMember("motor"), staleMember("api")]),
+    );
+    expect(banner).toEqual({
+      title: "Workspace graph may be stale",
+      summary: "2 of 3 members changed since analysis: motor, api.",
+      action:
+        "Run /understand --workspace to refresh them before relying on impact or onboarding answers.",
+      changedFiles: [],
+    });
+  });
+
+  it("mentions unverifiable members alongside stale ones without calling them stale", () => {
+    const banner = buildFreshnessBanner(
+      workspaceReport([staleMember("motor"), unknownMember("docs")]),
+    );
+    expect(banner?.title).toBe("Workspace graph may be stale");
+    expect(banner?.summary).toBe(
+      "1 of 2 members changed since analysis: motor. Could not verify 1 of 2 members (not a Git repository or Git unavailable): docs.",
+    );
+  });
+
+  it("reports unknown-only workspaces softly", () => {
+    const banner = buildFreshnessBanner(
+      workspaceReport([freshMember("brain"), unknownMember("docs")]),
+    );
+    expect(banner).toEqual({
+      title: "Workspace freshness could not be fully verified",
+      summary:
+        "Could not verify 1 of 2 members (not a Git repository or Git unavailable): docs.",
+      action: "Members outside Git cannot be checked; they are never reported as stale.",
+      changedFiles: [],
+    });
+  });
+
+  it("renders workspace strings from the active locale", () => {
+    const banner = buildFreshnessBanner(
+      workspaceReport([staleMember("motor"), freshMember("brain")]),
+      locales.ja.stalenessBanner,
+    );
+    expect(banner?.title).toBe(locales.ja.stalenessBanner.workspaceStaleTitle);
+    expect(banner?.summary).toContain("motor");
+    expect(banner?.summary).not.toContain("{names}");
   });
 });
