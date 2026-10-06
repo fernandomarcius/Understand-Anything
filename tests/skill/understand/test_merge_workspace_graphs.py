@@ -126,8 +126,12 @@ def _member_graph(
         "layers": [
             {"id": "layer:api", "name": "API", "description": "entry points",
              "nodeIds": ["file:src/main.ts", "function:src/main.ts:run"]},
+            # Every other file-level node (SKILL.md `fileLevelTypes`) must sit in a layer too,
+            # or the final validation of the workspace graph rejects the merge.
             {"id": "layer:core", "name": "Core", "description": "core",
-             "nodeIds": ["module:core", "concept:x"]},
+             "nodeIds": ["module:core", "concept:x", "config:package.json", "document:README.md",
+                         "service:Dockerfile", "pipeline:.github/workflows/ci.yml", "schema:db/schema.sql",
+                         "resource:infra/main.tf", "table:db/schema.sql:users", "endpoint:src/main.ts:GET /x"]},
         ],
         "tour": [
             {"order": 1, "title": "Start", "description": "entry",
@@ -408,6 +412,127 @@ class TestWorkspaceMerge(_WorkspaceCase):
         self.assertEqual(len(dropped), 1)
         self.assertEqual(dropped[0]["target"], "file:only/src/gone.ts")
         self.assertEqual(merged["project"]["description"], "Workspace of 1 services: only")
+
+
+# ── Final validation (plugin inline-validator rules) ──────────────────────
+
+def _valid_graph() -> dict[str, Any]:
+    return {
+        "nodes": [_node("file:a", "file", "a"), _node("function:a:f", "function", "a"),
+                  _node("table:a:t", "table", "a"), _node("endpoint:a:GET /", "endpoint", "a")],
+        "edges": [_edge("file:a", "function:a:f")],
+        "layers": [{"id": "layer:x", "name": "X", "description": "x",
+                    "nodeIds": ["file:a", "table:a:t", "endpoint:a:GET /"]}],
+        "tour": [{"order": 1, "title": "T", "description": "t", "nodeIds": ["file:a"]}],
+    }
+
+
+class TestValidateWorkspaceGraph(unittest.TestCase):
+    def _issues(self, mutate: Any) -> list[str]:
+        g = _valid_graph()
+        mutate(g)
+        return mwg.validate_workspace_graph(g)
+
+    def test_valid_graph(self) -> None:
+        self.assertEqual(mwg.validate_workspace_graph(_valid_graph()), [])
+
+    def test_violations(self) -> None:
+        cases = [
+            ("dangling edge", lambda g: g["edges"].append(_edge("file:a", "file:gone")), "'file:gone' not found"),
+            ("duplicate id", lambda g: g["nodes"].append(_node("function:a:f", "function")),
+             "duplicate node id 'function:a:f'"),
+            ("file-level outside layers", lambda g: g["layers"][0]["nodeIds"].remove("file:a"),
+             "file node 'file:a' is not in any layer"),
+            ("table outside layers", lambda g: g["layers"][0]["nodeIds"].remove("table:a:t"),
+             "table node 'table:a:t' is not in any layer"),
+            ("endpoint outside layers", lambda g: g["layers"][0]["nodeIds"].remove("endpoint:a:GET /"),
+             "endpoint node 'endpoint:a:GET /' is not in any layer"),
+            ("two layers", lambda g: g["layers"].append(
+                {"id": "layer:y", "name": "Y", "description": "y", "nodeIds": ["file:a"]}),
+             "node 'file:a' appears in layers 'layer:x' and 'layer:y'"),
+            ("layer refs missing node", lambda g: g["layers"][0]["nodeIds"].append("file:ghost"),
+             "layer 'layer:x' refs missing node 'file:ghost'"),
+            ("duplicate layer id", lambda g: g["layers"].append(
+                {"id": "layer:x", "name": "X2", "description": "x", "nodeIds": []}),
+             "duplicate layer id 'layer:x'"),
+            ("tour refs missing node", lambda g: g["tour"][0]["nodeIds"].append("file:ghost"),
+             "tour step[0] ('T') refs missing node 'file:ghost'"),
+        ]
+        for label, mutate, needle in cases:
+            with self.subTest(label):
+                issues = self._issues(mutate)
+                self.assertTrue(any(needle in i for i in issues), issues)
+
+    def test_non_file_level_nodes_need_no_layer(self) -> None:
+        self.assertEqual(self._issues(lambda g: g["nodes"].append(_node("concept:c", "concept"))), [])
+
+    def test_assert_lists_issues(self) -> None:
+        g = _valid_graph()
+        g["layers"] = []
+        with self.assertRaises(mwg.WorkspaceError) as ctx:
+            mwg.assert_valid_workspace_graph(g)
+        self.assertIn("3 issues", str(ctx.exception))
+        self.assertIn("file:a", str(ctx.exception))
+
+
+class TestFinalValidationOnMerge(_WorkspaceCase):
+    def _one_member(self, graph: dict[str, Any]) -> None:
+        self._member("a-repo", graph)
+        self._manifest({"name": "ws", "members": [{"name": "a", "path": "../a-repo"}]})
+
+    def _base(self) -> dict[str, Any]:
+        return _member_graph(commit="a", description="A", languages=[], frameworks=[])
+
+    def _expect_rejected(self, needle: str, *flags: str) -> None:
+        res = self._run(*flags)
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        self.assertIn("fails validation", res.stderr)
+        self.assertIn(needle, res.stderr)
+        self._assert_nothing_written()
+
+    def test_file_level_node_outside_layers_fails(self) -> None:
+        g = self._base()
+        g["layers"][1]["nodeIds"].remove("table:db/schema.sql:users")
+        self._one_member(g)
+        for flags in ((), ("--no-contracts",)):
+            with self.subTest(flags=flags):
+                self._expect_rejected("table node 'table:a/db/schema.sql:users' is not in any layer", *flags)
+
+    def test_node_in_two_layers_fails(self) -> None:
+        g = self._base()
+        g["layers"][1]["nodeIds"].append("file:src/main.ts")
+        self._one_member(g)
+        self._expect_rejected("node 'file:a/src/main.ts' appears in layers 'layer:a/api' and 'layer:a/core'")
+
+    def test_tour_ref_to_missing_node_fails(self) -> None:
+        g = self._base()
+        g["tour"][0]["nodeIds"].append("file:src/ghost.ts")
+        self._one_member(g)
+        self._expect_rejected("refs missing node 'file:a/src/ghost.ts'")
+
+    def test_layer_ref_to_missing_node_fails(self) -> None:
+        g = self._base()
+        g["layers"][0]["nodeIds"].append("file:src/ghost.ts")
+        self._one_member(g)
+        self._expect_rejected("layer 'layer:a/api' refs missing node 'file:a/src/ghost.ts'")
+
+    def test_dangling_member_edges_are_dropped_not_fatal(self) -> None:
+        # The fixture carries a member-dangling edge: the merge drops it, so the final graph is valid.
+        self._one_member(self._base())
+        res = self._run()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(mwg.validate_workspace_graph(self._out("knowledge-graph.json")), [])
+
+    def test_failed_validation_keeps_previous_outputs(self) -> None:
+        self._one_member(self._base())
+        self.assertEqual(self._run().returncode, 0)
+        before = (self.root / ".ua" / "knowledge-graph.json").read_bytes()
+        g = self._base()
+        g["layers"] = []
+        self._member("a-repo", g)
+        res = self._run()
+        self.assertNotEqual(res.returncode, 0)
+        self.assertEqual((self.root / ".ua" / "knowledge-graph.json").read_bytes(), before)
 
 
 # ── Errors: exit ≠ 0 and nothing written ──────────────────────────────────

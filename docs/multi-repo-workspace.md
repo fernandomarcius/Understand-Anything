@@ -111,6 +111,15 @@ member directory. The skill runs it before any member pipeline.
 
 Invariant checked by the script before writing: the number of workspace nodes equals the sum of
 member node counts (namespacing makes collisions impossible; a mismatch is a bug → exit ≠ 0).
+With contracts linked it becomes `sum(members[].nodes) + project.workspace.contracts.nodes`.
+
+Final validation, also before writing (`validate_workspace_graph`, same rules as the plugin's
+inline validator in `SKILL.md`): no duplicate node or layer ids, no dangling edges, every
+`layers[].nodeIds` / `tour[].nodeIds` entry exists, and every node of a file-level type
+(`file config document service pipeline table schema resource endpoint`) sits in exactly one
+layer. Any violation — including one inherited from a member graph — exits ≠ 0 listing the issues
+(first 20) and writes nothing; previous outputs stay untouched. Member-dangling edges are dropped
+by the merge (see above), so they never reach this check.
 
 ## Dashboard / viewer
 
@@ -167,7 +176,7 @@ Both `packages/dashboard/vite.config.ts` and `packages/viewer/bin/viewer.mjs` im
    (its own `.ua/`, incremental by default, `--language`, `--exclude` and `--full` forwarded). Members whose
    `meta.json.gitCommitHash` equals their current `HEAD` and that have a graph are skipped
    without any LLM call.
-3. Run `merge-workspace-graphs.py <root>`.
+3. Run `merge-workspace-graphs.py <root>` (merge + contract linking + validation; `--no-contracts` skips linking).
 4. Launch the dashboard on the workspace root.
 
 ---
@@ -238,7 +247,7 @@ no class route is absolute; resolve `const string` used in attributes within the
 `IApplicationModelConvention` that prepends a constant prefix to every controller of a folder/assembly
 when it is statically recognizable; catch-alls keep `catchAll: true` and their `Order`.
 
-## Linking — `link-contracts.py <workspaceRoot>` (called by `merge-workspace-graphs.py` after the merge)
+## Linking — `link-contracts.py <workspaceRoot>` (run in memory by `merge-workspace-graphs.py` after the merge)
 
 1. Load every member's `contracts.json` (missing file ⇒ that member contributes nothing; warn).
 2. **Resolve each consumer's target member** in this order:
@@ -265,3 +274,32 @@ when it is statically recognizable; catch-alls keep `catchAll: true` and their `
    and coverage `linked / (consumers with a non-external target)`.
 
 The linker is idempotent: re-running it on the same inputs yields byte-identical output.
+
+### Linker details
+
+- **Invocation.** `merge-workspace-graphs.py` links in memory (`link_workspace`) and validates the
+  result before writing graph, meta and report together. `link-contracts.py <root>` re-links an
+  already merged graph on disk with the same validation. `merge-workspace-graphs.py --no-contracts`
+  skips linking: the graph is rebuilt from the member graphs, so it carries no linker node, edge or
+  layer and no `project.workspace.contracts`, and a stale `.ua/contracts-report.json` is deleted.
+- **`generatedBy: "link-contracts"`** marks every node and edge the linker creates. A re-run removes
+  them (plus the contracts layer) before linking again. Pre-existing member nodes are reused, never
+  marked or moved — e.g. an endpoint the member analysis already produced keeps its member layer.
+- **`project.workspace.contracts`** = `{ "nodes": <added>, "edges": <added> }` (counts of
+  `generatedBy` items; `0/0` when nothing linked).
+- **Contracts layer.** Every node the linker creates (`endpoint`, shared `table`, channel `concept`)
+  goes into `layer:workspace/contratos` ("Contratos entre serviços", with a description),
+  `nodeIds` sorted. Rebuilt on each run; omitted when the linker creates no node.
+- **Confidence** of a `calls` edge = `consumer.confidence` (default `1.0` when absent or outside
+  `(0, 1]`) × match factor (literal `1.0`, templated `0.9`, catch-all `0.5`) × resolution factor
+  (`binding` / manifest `env` `1.0`, member env / base literal `0.9`), rounded to 3 decimals. Several
+  call sites of the same file→endpoint pair share one edge: `callSites` counts them and the edge
+  keeps the highest confidence. Fixed weights: `routes` 1.0, `publishes`/`subscribes` 0.9,
+  `writes_to`/`reads_from` 0.8.
+- **Precedence.** Target: manifest `bindings` → manifest `env` → member `env` → `base.value`
+  literal; within values, host/service name/hostname beats published port, and a host or port
+  served by ≥ 2 members is reported ambiguous (unresolved). Route: literal → templated → catch-all,
+  then lower `order`, then first by (file, line). The best route whose method fits wins; if only
+  other-method routes match, the consumer is `method-mismatch`.
+- **`ANY` method.** A provider method `ANY`, `*` or empty accepts every consumer method; a consumer
+  without a method matches any provider method. Endpoint ids and names print a missing method as `ANY`.

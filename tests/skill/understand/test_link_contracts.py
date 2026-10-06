@@ -55,15 +55,18 @@ def _file_node(path: str) -> dict[str, Any]:
 
 def _graph(commit: str, files: list[str], *, extra_nodes: list[dict] | None = None,
            extra_edges: list[dict] | None = None) -> dict[str, Any]:
+    nodes = [_file_node(f) for f in files] + (extra_nodes or [])
     return {
         "version": "1.0.0",
         "kind": "codebase",
         "project": {"name": "m", "languages": ["typescript"], "frameworks": [],
                     "description": "member", "analyzedAt": "2026-10-01T10:00:00.000Z",
                     "gitCommitHash": commit},
-        "nodes": [_file_node(f) for f in files] + (extra_nodes or []),
+        "nodes": nodes,
         "edges": list(extra_edges or []),
-        "layers": [],
+        # One layer holding every node: the workspace graph is validated before it is written.
+        "layers": [{"id": "layer:all", "name": "All", "description": "every node",
+                    "nodeIds": [n["id"] for n in nodes]}],
         "tour": [],
     }
 
@@ -677,6 +680,63 @@ class TestLinkEndToEnd(_Workspace):
         self.assertEqual(len(g["nodes"]), sum(m["nodes"] for m in ws["members"]) + ws["contracts"]["nodes"])
 
 
+    def test_contracts_layer(self) -> None:
+        layers = [l for l in self.g["layers"] if l["id"] == "layer:workspace/contratos"]
+        self.assertEqual(len(layers), 1)
+        layer = layers[0]
+        self.assertEqual(layer["name"], "Contratos entre serviços")
+        self.assertTrue(layer["description"])
+        generated = sorted(n["id"] for n in self.g["nodes"] if n.get("generatedBy") == "link-contracts")
+        self.assertEqual(layer["nodeIds"], generated)
+        self.assertEqual({self.nodes[i]["type"] for i in generated}, {"endpoint", "concept", "table"})
+        # The member's own endpoint node keeps its member layer and is not duplicated.
+        pre = PREEXISTING_ENDPOINT.replace("endpoint:", "endpoint:gestao/")
+        self.assertNotIn(pre, layer["nodeIds"])
+        gestao_layer = next(l for l in self.g["layers"] if l["id"] == "layer:gestao/all")
+        self.assertIn(pre, gestao_layer["nodeIds"])
+        # Every file-level node (plugin's fileLevelTypes) in exactly one layer; whole graph valid.
+        owners: dict[str, list[str]] = {}
+        for l in self.g["layers"]:
+            for nid in l["nodeIds"]:
+                owners.setdefault(nid, []).append(l["id"])
+        for n in self.g["nodes"]:
+            if n["type"] in lc._mwg.LAYERED_TYPES:
+                self.assertEqual(len(owners.get(n["id"], [])), 1, n["id"])
+        self.assertEqual(lc._mwg.validate_workspace_graph(self.g), [])
+
+    def test_contracts_layer_is_rebuilt_and_dropped_when_empty(self) -> None:
+        c = front_contracts()
+        c["consumers"] = []
+        (self.tmp / "front-repo" / ".ua" / "contracts.json").write_text(json.dumps(c), encoding="utf-8")
+        self.assertEqual(self._link().returncode, 0)
+        g = self._read("knowledge-graph.json")
+        layers = [l for l in g["layers"] if l["id"] == "layer:workspace/contratos"]
+        self.assertEqual(len(layers), 1)
+        self.assertEqual(layers[0]["nodeIds"],
+                         sorted(n["id"] for n in g["nodes"] if n.get("generatedBy") == "link-contracts"))
+
+        for name in ("front", "gestao", "motor", "excel", "brain"):
+            (self.tmp / f"{name}-repo" / ".ua" / "contracts.json").write_text(
+                json.dumps(_contracts()), encoding="utf-8")
+        res = self._link()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        g = self._read("knowledge-graph.json")
+        self.assertFalse(any(l["id"] == "layer:workspace/contratos" for l in g["layers"]))
+        self.assertEqual(g["project"]["workspace"]["contracts"], {"nodes": 0, "edges": 0})
+        self.assertFalse(any(n.get("generatedBy") for n in g["nodes"]))
+
+    def test_standalone_link_refuses_invalid_graph_and_writes_nothing(self) -> None:
+        g = self._read("knowledge-graph.json")
+        g["layers"] = [l for l in g["layers"] if l["id"] != "layer:motor/all"]
+        (self.root / ".ua" / "knowledge-graph.json").write_text(json.dumps(g), encoding="utf-8")
+        before = self._bytes("knowledge-graph.json"), self._bytes("contracts-report.json")
+        res = self._link()
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("fails validation", res.stderr)
+        self.assertIn(f"file:motor/{MOTOR_CTRL}' is not in any layer", res.stderr)
+        self.assertEqual((self._bytes("knowledge-graph.json"), self._bytes("contracts-report.json")), before)
+
+
 class TestNoContractsFlag(_Workspace):
     def test_merge_without_linking(self) -> None:
         self._standard()
@@ -687,6 +747,22 @@ class TestNoContractsFlag(_Workspace):
         self.assertFalse(any(e.get("crossService") for e in g["edges"]))
         self.assertNotIn("contracts", g["project"]["workspace"])
         self.assertFalse((self.root / ".ua" / "contracts-report.json").exists())
+
+    def test_no_contracts_after_linked_merge_leaves_nothing_stale(self) -> None:
+        self._standard()
+        self.assertEqual(self._merge().returncode, 0)
+        self.assertTrue((self.root / ".ua" / "contracts-report.json").exists())
+        res = self._merge("--no-contracts")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse((self.root / ".ua" / "contracts-report.json").exists())
+        g = self._read("knowledge-graph.json")
+        self.assertFalse(any(n.get("generatedBy") for n in g["nodes"]))
+        self.assertFalse(any(e.get("generatedBy") for e in g["edges"]))
+        self.assertFalse(any(l["id"] == "layer:workspace/contratos" for l in g["layers"]))
+        ws = g["project"]["workspace"]
+        self.assertNotIn("contracts", ws)
+        self.assertEqual(len(g["nodes"]), sum(m["nodes"] for m in ws["members"]))
+        self.assertEqual(lc._mwg.validate_workspace_graph(g), [])
 
     def test_link_requires_merged_graph(self) -> None:
         self._standard()

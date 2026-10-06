@@ -14,10 +14,13 @@ member's routes and emits the links into the already-merged workspace graph:
     `writes_to` / `reads_from`        file → shared `table:workspace/<schema.table>` node
                                       (only for tables touched by >= 2 members)
 
-Everything it adds carries `"generatedBy": "link-contracts"`; a re-run first
-removes those items, so the output is byte-identical for the same inputs. The
-workspace node-count invariant becomes
-`len(nodes) == sum(members[].nodes) + project.workspace.contracts.nodes`.
+Everything it adds carries `"generatedBy": "link-contracts"` and every node it
+creates sits in the layer `layer:workspace/contratos` (absent when it creates
+none); a re-run first removes those items, so the output is byte-identical for
+the same inputs. The workspace node-count invariant becomes
+`len(nodes) == sum(members[].nodes) + project.workspace.contracts.nodes`, and
+the result must pass merge-workspace-graphs.py's `validate_workspace_graph`
+before anything is written.
 
 Usage:
     python link-contracts.py <workspace-root>
@@ -29,7 +32,8 @@ Output:
                                       consumers, messages, tables, coverage
     <ua-dir>/meta.json                `analyzedFiles` refreshed if needed
 
-Stdlib only; no LLM involved. Usually called by merge-workspace-graphs.py.
+Stdlib only; no LLM involved. Usually run in memory by merge-workspace-graphs.py
+(`link_workspace`); this CLI re-links an already merged graph.
 """
 
 from __future__ import annotations
@@ -44,6 +48,13 @@ from typing import Any
 
 GENERATED = "link-contracts"
 REPORT_NAME = "contracts-report.json"
+CONTRACTS_LAYER = {
+    "id": "layer:workspace/contratos",
+    "name": "Contratos entre serviços",
+    "description": "Pontos de contato entre os membros do workspace criados pelo link-contracts: "
+                   "endpoints HTTP chamados por outro serviço, canais de mensagem compartilhados e "
+                   "tabelas tocadas por dois ou mais membros.",
+}
 CONTRACTS_NAME = "contracts.json"
 SUPPORTED_VERSION = 1
 
@@ -54,11 +65,17 @@ ANY_METHODS = {"", "ANY", "*"}
 
 
 def _load_merge_module() -> Any:
+    # merge-workspace-graphs.py registers itself under this name before loading
+    # this module, so both share one WorkspaceError class.
+    cached = sys.modules.get("_ua_merge_workspace_graphs")
+    if cached is not None:
+        return cached
     path = Path(__file__).resolve().with_name("merge-workspace-graphs.py")
     spec = importlib.util.spec_from_file_location("_ua_merge_workspace_graphs", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules["_ua_merge_workspace_graphs"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -392,10 +409,12 @@ def _endpoint_id(member: str, prov: dict[str, Any]) -> str:
 def link(graph: dict[str, Any], members: list[str], contracts: dict[str, dict[str, Any]],
          bindings: dict[str, str], env: dict[str, str], warnings: list[str]) -> dict[str, Any]:
     """Strip previous links from `graph`, add new ones in place and return the report."""
+    removed_ids = {n.get("id") for n in graph["nodes"] if n.get("generatedBy") == GENERATED}
     graph["nodes"] = [n for n in graph["nodes"] if n.get("generatedBy") != GENERATED]
     kept_ids = {n.get("id") for n in graph["nodes"]}
     graph["edges"] = [e for e in graph["edges"] if e.get("generatedBy") != GENERATED
                       and e.get("source") in kept_ids and e.get("target") in kept_ids]
+    _strip_contracts_layer(graph, removed_ids)
     em = _Emitter(graph, warnings)
     ctx = {"bindings": bindings, "env": env, "contracts": contracts, "services": _ServiceIndex(contracts)}
 
@@ -498,6 +517,8 @@ def link(graph: dict[str, Any], members: list[str], contracts: dict[str, dict[st
 
     graph["nodes"].extend(em.nodes.values())
     graph["edges"].extend(em.edges.values())
+    if em.nodes:
+        graph["layers"].append({**CONTRACTS_LAYER, "nodeIds": sorted(em.nodes)})
     return {
         "version": 1,
         "members": [_member_summary(m, contracts.get(m)) for m in members],
@@ -511,6 +532,23 @@ def link(graph: dict[str, Any], members: list[str], contracts: dict[str, dict[st
         "graph": {"nodesAdded": len(em.nodes), "edgesAdded": len(em.edges)},
         "warnings": warnings,
     }
+
+
+def _strip_contracts_layer(graph: dict[str, Any], removed_ids: set[Any]) -> None:
+    """Drop the contracts layer and any reference to previously generated nodes."""
+    layers = graph.get("layers") if isinstance(graph.get("layers"), list) else []
+    kept: list[Any] = []
+    for layer in layers:
+        if isinstance(layer, dict) and layer.get("id") == CONTRACTS_LAYER["id"]:
+            continue
+        if removed_ids and isinstance(layer, dict) and isinstance(layer.get("nodeIds"), list):
+            layer["nodeIds"] = [i for i in layer["nodeIds"] if i not in removed_ids]
+        kept.append(layer)
+    graph["layers"] = kept
+    if removed_ids and isinstance(graph.get("tour"), list):
+        for step in graph["tour"]:
+            if isinstance(step, dict) and isinstance(step.get("nodeIds"), list):
+                step["nodeIds"] = [i for i in step["nodeIds"] if i not in removed_ids]
 
 
 def _member_summary(member: str, c: dict[str, Any] | None) -> dict[str, Any]:
@@ -668,15 +706,54 @@ def load_contracts(member: dict[str, Any], warnings: list[str]) -> dict[str, Any
     return data
 
 
+def link_workspace(graph: dict[str, Any], members: list[dict[str, Any]],
+                   manifest: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Link contracts into a merged workspace graph in place.
+
+    `members` are validated manifest members ({"name", "dir", ...}). Sets
+    `project.workspace.contracts`, checks the node-count invariant and returns
+    (report, warnings). Raises WorkspaceError.
+    """
+    ws = graph.get("project", {}).get("workspace") if isinstance(graph.get("project"), dict) else None
+    if not isinstance(ws, dict) or not isinstance(graph.get("nodes"), list) \
+            or not isinstance(graph.get("edges"), list):
+        raise WorkspaceError("not a merged workspace graph")
+    if not isinstance(graph.get("layers"), list):
+        graph["layers"] = []
+
+    warnings: list[str] = []
+    contracts: dict[str, dict[str, Any]] = {}
+    for m in members:
+        c = load_contracts(m, warnings)
+        if c is not None:
+            contracts[m["name"]] = c
+    report = link(graph, [m["name"] for m in members], contracts,
+                  manifest.get("bindings") or {}, manifest.get("env") or {}, warnings)
+
+    ws["contracts"] = {"nodes": report["graph"]["nodesAdded"], "edges": report["graph"]["edgesAdded"]}
+    expected = sum(_int(m.get("nodes")) for m in _list(ws.get("members")) if isinstance(m, dict)) \
+        + ws["contracts"]["nodes"]
+    if len(graph["nodes"]) != expected or len({n.get("id") for n in graph["nodes"]}) != expected:
+        raise WorkspaceError(f"invariant broken: workspace has {len(graph['nodes'])} nodes, "
+                             f"members + contracts sum to {expected}")
+    return report, warnings
+
+
+def summary_line(report: dict[str, Any], report_path: Path) -> str:
+    cov = report["coverage"]
+    ratio = "n/a" if cov["ratio"] is None else f"{cov['ratio']:.1%}"
+    return (f"Contracts: {cov['linked']}/{cov['eligible']} consumers linked ({ratio}), "
+            f"{len(report['consumers']['unresolved'])} unresolved, {len(report['consumers']['unmatched'])} "
+            f"unmatched, {len(report['providersWithoutConsumers'])} providers without consumers; "
+            f"+{report['graph']['nodesAdded']} nodes, +{report['graph']['edgesAdded']} edges -> {report_path}")
+
+
 def run(root: Path) -> int:
     """Link contracts of the workspace at `root`. Returns the process exit code."""
     root = root.resolve()
+    warnings: list[str] = []
     try:
-        manifest_path = root / _mwg.MANIFEST_NAME
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as e:
-            raise WorkspaceError(f"cannot read {manifest_path}: {e}") from e
+        manifest = _mwg.read_manifest(root)
         _ws_name, members = _mwg.validate_manifest(root, manifest)
         ua_dir = _mwg.resolve_ua_dir(root)
         graph_path = ua_dir / "knowledge-graph.json"
@@ -685,27 +762,16 @@ def run(root: Path) -> int:
         except (OSError, json.JSONDecodeError) as e:
             raise WorkspaceError(f"merged workspace graph not readable at {graph_path} "
                                  f"(run merge-workspace-graphs.py first): {e}") from e
-        ws = graph.get("project", {}).get("workspace") if isinstance(graph.get("project"), dict) else None
-        if not isinstance(ws, dict) or not isinstance(graph.get("nodes"), list) \
-                or not isinstance(graph.get("edges"), list):
+        if not isinstance(graph, dict):
             raise WorkspaceError(f"{graph_path} is not a merged workspace graph")
-
-        warnings: list[str] = []
-        contracts: dict[str, dict[str, Any]] = {}
-        for m in members:
-            c = load_contracts(m, warnings)
-            if c is not None:
-                contracts[m["name"]] = c
-        report = link(graph, [m["name"] for m in members], contracts,
-                      manifest.get("bindings") or {}, manifest.get("env") or {}, warnings)
-
-        ws["contracts"] = {"nodes": report["graph"]["nodesAdded"], "edges": report["graph"]["edgesAdded"]}
-        expected = sum(_int(m.get("nodes")) for m in _list(ws.get("members")) if isinstance(m, dict)) \
-            + ws["contracts"]["nodes"]
-        if len(graph["nodes"]) != expected or len({n.get("id") for n in graph["nodes"]}) != expected:
-            raise WorkspaceError(f"invariant broken: workspace has {len(graph['nodes'])} nodes, "
-                                 f"members + contracts sum to {expected}")
+        try:
+            report, warnings = link_workspace(graph, members, manifest)
+        except WorkspaceError as e:
+            raise WorkspaceError(f"{graph_path}: {e}") from e
+        _mwg.assert_valid_workspace_graph(graph)
     except WorkspaceError as e:
+        for w in warnings:
+            print(f"Warning: {w}", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
@@ -725,12 +791,7 @@ def run(root: Path) -> int:
             meta["analyzedFiles"] = files
             _mwg._atomic_write_json(meta_path, meta)
 
-    cov = report["coverage"]
-    ratio = "n/a" if cov["ratio"] is None else f"{cov['ratio']:.1%}"
-    print(f"Contracts: {cov['linked']}/{cov['eligible']} consumers linked ({ratio}), "
-          f"{len(report['consumers']['unresolved'])} unresolved, {len(report['consumers']['unmatched'])} unmatched, "
-          f"{len(report['providersWithoutConsumers'])} providers without consumers; "
-          f"+{report['graph']['nodesAdded']} nodes, +{report['graph']['edgesAdded']} edges -> {ua_dir / REPORT_NAME}")
+    print(summary_line(report, ua_dir / REPORT_NAME))
     return 0
 
 
