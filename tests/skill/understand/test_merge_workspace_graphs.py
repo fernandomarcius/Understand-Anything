@@ -516,6 +516,67 @@ class TestWorkspaceErrors(_WorkspaceCase):
         self._expect_failure("concept:a/x")
 
 
+class TestManifestBindingsAndEnv(_WorkspaceCase):
+    """Optional `bindings` / `env` maps used by the contract linker."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.tmp / "a-repo").mkdir()
+        (self.tmp / "b-repo").mkdir()
+
+    def _with(self, **extra: Any) -> subprocess.CompletedProcess:
+        self._manifest({"name": "ws", "members": [
+            {"name": "a", "path": "../a-repo"}, {"name": "b", "path": "../b-repo"}], **extra})
+        return self._run("--validate-only")
+
+    def test_valid_bindings_and_env(self) -> None:
+        res = self._with(
+            bindings={"REACT_APP_API_MOTOR_CALCULO": "a:/api/motor",
+                      "API_B": "b",
+                      "REACT_APP_API_AUTENTICACAO": "external:autenticacao"},
+            env={"APP_API_GESTAO_OPERACAO": "http://gestao-operacao:8080/"})
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_invalid_bindings(self) -> None:
+        cases = [
+            ("not-an-object", "bindings"),
+            ({"X": 1}, "bindings.X"),
+            ({"X": ""}, "bindings.X"),
+            ({"X": "ghost"}, "ghost"),
+            ({"X": "ghost:/api"}, "ghost"),
+            ({"X": "a:api/motor"}, "bindings.X"),
+            ({"X": "external:"}, "bindings.X"),
+            ({"": "a"}, "bindings"),
+        ]
+        for bindings, needle in cases:
+            with self.subTest(bindings=bindings):
+                res = self._with(bindings=bindings)
+                self.assertNotEqual(res.returncode, 0, res.stdout)
+                self.assertIn(needle, res.stderr)
+
+    def test_invalid_env(self) -> None:
+        cases = [
+            (["x"], "env"),
+            ({"X": 1}, "env.X"),
+            ({"X": ""}, "env.X"),
+            ({"": "http://x"}, "env"),
+        ]
+        for env, needle in cases:
+            with self.subTest(env=env):
+                res = self._with(env=env)
+                self.assertNotEqual(res.returncode, 0, res.stdout)
+                self.assertIn(needle, res.stderr)
+
+    def test_invalid_binding_fails_full_merge_and_writes_nothing(self) -> None:
+        self._member("a-repo", _member_graph(commit="a", description="A", languages=[], frameworks=[]))
+        self._manifest({"name": "ws", "members": [{"name": "a", "path": "../a-repo"}],
+                        "bindings": {"X": "ghost"}})
+        res = self._run()
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("bindings.X", res.stderr)
+        self._assert_nothing_written()
+
+
 class TestValidateOnly(_WorkspaceCase):
     """`--validate-only`: manifest check for the skill, before any member runs."""
 

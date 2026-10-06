@@ -10,13 +10,18 @@ name so IDs can never collide. The merge is deterministic and LLM-free; the
 contract lives in docs/multi-repo-workspace.md.
 
 Usage:
-    python merge-workspace-graphs.py <workspace-root>
+    python merge-workspace-graphs.py <workspace-root> [--no-contracts]
     python merge-workspace-graphs.py <workspace-root> --validate-only
 
 `--validate-only` checks the manifest only (member graphs are not read, nothing
 is written) and prints `{"name", "members": [{"name", "path", "dir"}]}` as JSON
 to stdout, `dir` being the resolved absolute member directory. The
 `/understand --workspace` skill uses it before running the member pipelines.
+
+After a successful merge it runs link-contracts.py (cross-service contracts:
+HTTP calls, message channels, shared tables) unless `--no-contracts` is given.
+The manifest may carry optional `bindings` ({ ENV: "member[:/prefix]" |
+"external:<label>" }) and `env` ({ ENV: "url" }) maps for that linker.
 
 Output:
     <ua-dir>/knowledge-graph.json   merged workspace graph
@@ -108,7 +113,55 @@ def validate_manifest(root: Path, manifest: Any) -> tuple[str, list[dict[str, An
                     f"are nested ({mdir} / {odir})")
         members.append({"name": mname, "path": mpath, "dir": mdir})
 
+    validate_bindings(manifest.get("bindings"), {m["name"] for m in members})
+    validate_env(manifest.get("env"))
     return name, members
+
+
+def parse_binding(value: str) -> tuple[str, str, str]:
+    """`"member[:/prefix]"` → ("member", name, prefix); `"external:<label>"` → ("external", label, "")."""
+    if value.startswith("external:"):
+        return "external", value[len("external:"):], ""
+    target, sep, prefix = value.partition(":")
+    return "member", target, prefix if sep else ""
+
+
+def validate_bindings(bindings: Any, member_names: set[str]) -> None:
+    """Optional `{ ENV_NAME: "member[:/prefix]" | "external:<label>" }`; member must exist."""
+    if bindings is None:
+        return
+    if not isinstance(bindings, dict):
+        raise WorkspaceError(f"{MANIFEST_NAME}: field 'bindings' must be an object")
+    for key, value in bindings.items():
+        if not key:
+            raise WorkspaceError(f"{MANIFEST_NAME}: field 'bindings' has an empty variable name")
+        field = f"bindings.{key}"
+        if not isinstance(value, str) or not value:
+            raise WorkspaceError(
+                f"{MANIFEST_NAME}: {field} must be \"member[:/prefix]\" or \"external:<label>\" (got {value!r})")
+        kind, target, prefix = parse_binding(value)
+        if kind == "external":
+            if not target:
+                raise WorkspaceError(f"{MANIFEST_NAME}: {field} needs a label after 'external:'")
+            continue
+        if target not in member_names:
+            raise WorkspaceError(f"{MANIFEST_NAME}: {field} points to unknown member '{target}'")
+        if ":" in value and not prefix.startswith("/"):
+            raise WorkspaceError(
+                f"{MANIFEST_NAME}: {field} path prefix must start with '/' (got {prefix!r})")
+
+
+def validate_env(env: Any) -> None:
+    """Optional `{ ENV_NAME: "url" }` — workspace-level values for consumer bases."""
+    if env is None:
+        return
+    if not isinstance(env, dict):
+        raise WorkspaceError(f"{MANIFEST_NAME}: field 'env' must be an object")
+    for key, value in env.items():
+        if not key:
+            raise WorkspaceError(f"{MANIFEST_NAME}: field 'env' has an empty variable name")
+        if not isinstance(value, str) or not value:
+            raise WorkspaceError(f"{MANIFEST_NAME}: env.{key} must be a non-empty string (got {value!r})")
 
 
 def load_manifest(root: Path) -> tuple[str, list[dict[str, Any]]]:
@@ -342,13 +395,29 @@ def build_config(ua_dir: Path, output_language: str | None) -> dict[str, Any] | 
     return {**config, "outputLanguage": output_language}
 
 
-USAGE = "Usage: python merge-workspace-graphs.py <workspace-root> [--validate-only]"
+USAGE = "Usage: python merge-workspace-graphs.py <workspace-root> [--validate-only] [--no-contracts]"
+FLAGS = {"--validate-only", "--no-contracts"}
+
+
+def run_contract_linker(root: Path) -> int:
+    """Run link-contracts.py (same directory) on the freshly merged workspace graph."""
+    import importlib.util
+
+    path = Path(__file__).resolve().with_name("link-contracts.py")
+    spec = importlib.util.spec_from_file_location("_ua_link_contracts", path)
+    if spec is None or spec.loader is None:
+        print(f"Error: cannot load {path}", file=sys.stderr)
+        return 1
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.run(root)
 
 
 def main() -> None:
     args = sys.argv[1:]
     validate_only = "--validate-only" in args
-    positional = [a for a in args if a != "--validate-only"]
+    no_contracts = "--no-contracts" in args
+    positional = [a for a in args if a not in FLAGS]
     if len(positional) != 1 or positional[0].startswith("-"):
         print(USAGE, file=sys.stderr)
         sys.exit(1)
@@ -397,6 +466,11 @@ def main() -> None:
     print(f"Workspace '{ws_name}' total: {len(merged['nodes'])} nodes, {len(merged['edges'])} edges, "
           f"{len(merged['layers'])} layers, {len(merged['tour'])} tour steps "
           f"({len(report)} dropped edges) -> {ua_dir / 'knowledge-graph.json'}")
+
+    if not no_contracts:
+        code = run_contract_linker(root)
+        if code != 0:
+            sys.exit(code)
 
 
 if __name__ == "__main__":

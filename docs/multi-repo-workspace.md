@@ -169,3 +169,99 @@ Both `packages/dashboard/vite.config.ts` and `packages/viewer/bin/viewer.mjs` im
    without any LLM call.
 3. Run `merge-workspace-graphs.py <root>`.
 4. Launch the dashboard on the workspace root.
+
+---
+
+# Cross-service contracts (stage 2 / 2b / 3)
+
+Monorepos get cross-module edges from a deterministic import resolver. Services talk over HTTP,
+queues and shared tables instead, so the workspace gets an equivalent **deterministic contract
+linker**: extract what each member *provides* and *consumes*, resolve where each consumer points,
+and link them. No LLM is involved; every link carries evidence and a confidence.
+
+## Per-member extraction — `extract-contracts.mjs <memberRoot> [--out <file>]`
+
+Writes `<memberRoot>/.ua/contracts.json` (data dir rule applies). Runs on files tracked by git
+(`git ls-files`), honoring `.understandignore`. Schema (`version: 1`):
+
+```jsonc
+{
+  "version": 1,
+  "providers": [            // HTTP routes this member exposes
+    { "kind": "http", "method": "GET", "route": "/api/Operacoes/elegiveis",   // composed, normalized (see below)
+      "rawRoute": "elegiveis", "framework": "aspnet|fastapi|flask|express|nestjs|http.server|openapi",
+      "file": "API/Controllers/OperacoesController.cs", "line": 68,
+      "symbol": "OperacoesController.Elegiveis",          // optional
+      "catchAll": false, "order": 0 }                      // ASP.NET {**x} catch-all + Order
+  ],
+  "consumers": [            // outbound HTTP calls
+    { "kind": "http", "method": "GET", "path": "/Operacoes/elegiveis",        // path relative to the base, template-normalized; may be null if unknown
+      "base": { "type": "env|config|literal|unknown", "name": "REACT_APP_API_GESTAO_OPERACAO", "value": null, "suffix": "" },
+      "via": "superagent-wrapper|axios|axios.create|fetch|requests|httpx|HttpClient|typed-client|helper",
+      "file": "src/api/operacaoApi.js", "line": 17, "confidence": 0.9 }
+  ],
+  "messages": {             // stage 2b — queues / topics / commands
+    "publish":   [ { "channel": "brain-relatorio-detalhado", "system": "codeq|kafka|rabbitmq|redis|unknown", "file": "...", "line": 1 } ],
+    "subscribe": [ { "channel": "brain-relatorio-*",         "system": "codeq", "file": "...", "line": 1 } ]
+  },
+  "tables": {               // stage 2b — data coupling
+    "reads":  [ { "table": "dbo.LOG_RESUMO", "file": "...", "line": 1 } ],
+    "writes": [ { "table": "dbo.LOG_RESUMO", "file": "...", "line": 1 } ]
+  },
+  "env": [                  // stage 3 — configuration values found in deploy/config files
+    { "name": "REACT_APP_API_GESTAO_OPERACAO", "value": "http://172.16.50.47:8082/api",
+      "source": "docker-compose.yml", "line": 24, "scope": "compose|dockerfile|env-example|env|k8s|appsettings|helm" }
+  ],
+  "services": [             // stage 3 — what this member deploys and where it listens
+    { "name": "gestao-operacao", "ports": ["8082:8080"], "hostnames": ["csfcloudbigestaooperacaodev.azurewebsites.net"],
+      "source": "docker-compose.yml", "line": 13 }
+  ],
+  "stats": { "providers": 0, "consumers": 0, "unresolvedConsumers": 0 }
+}
+```
+
+Secrets: env values that look like credentials (keys named `*KEY*`, `*SECRET*`, `*PASSWORD*`,
+`*TOKEN*`, connection strings with `Password=`/`pwd=`, JWTs, PEM blocks) are **never** written;
+store `"value": null, "redacted": true`. Only URL-like values (scheme://host[:port][/path]) and
+bare host:port are kept.
+
+### Route normalization (shared by providers and consumers)
+
+- strip scheme/host; strip query string and fragment; collapse `//`; ensure leading `/`; drop trailing `/` (except root);
+- template parameters become `{}`: `{id}`, `{id:int}`, `{**resto}` (catch-all, flagged), `:id`, `<int:id>`, `${expr}` (JS template), `{0}`/f-string `{x}`;
+- matching is case-insensitive (ASP.NET is); the stored value keeps the original case.
+
+### ASP.NET composition rules
+Class `[Route]` + action template; `[controller]` = class name minus `Controller` (not the file name);
+`[action]` = method name; leading `/` on an action template discards the class route; a template with
+no class route is absolute; resolve `const string` used in attributes within the same file; honor an
+`IApplicationModelConvention` that prepends a constant prefix to every controller of a folder/assembly
+when it is statically recognizable; catch-alls keep `catchAll: true` and their `Order`.
+
+## Linking — `link-contracts.py <workspaceRoot>` (called by `merge-workspace-graphs.py` after the merge)
+
+1. Load every member's `contracts.json` (missing file ⇒ that member contributes nothing; warn).
+2. **Resolve each consumer's target member** in this order:
+   1. manifest `bindings` (optional, explicit — wins): `"bindings": { "REACT_APP_API_MOTOR_CALCULO": "gestao:/api/motor" }` means
+      "this base points to member `gestao`, with path prefix `/api/motor`". A binding to `"external:<label>"` marks it intentionally external.
+   2. `env` values of the consumer's own member (and of the workspace manifest's optional `env` map) → URL → host:port/hostname
+      → member whose `services` publish that port/hostname (or whose `services[].name` equals the host).
+      `base.suffix` / path segments embedded in the env value are prepended to the consumer path.
+   3. otherwise ⇒ `unresolved`.
+3. **Match** the (method, prefix + path) against the target member's providers using the normalized form.
+   Literal routes beat templated ones; templated beat catch-alls; ties keep the first by file order. A method
+   mismatch with an exact path is reported, not linked.
+4. **Emit into the workspace graph** (namespaced ids):
+   - an `endpoint` node per matched provider route (id `endpoint:<M>/<file>:<METHOD> <route>`) and a `routes`
+     edge from the provider file node to it (existing edge type; no new types are introduced);
+   - a `calls` edge from the consumer file node to the endpoint node, with `crossService: true`, `confidence`,
+     and `evidence: { consumer: "M/file:line", provider: "N/file:line", via, base }`;
+   - messages: `publishes` (publisher file → `concept:<system>/<channel>` node) and `subscribes` (consumer file → same node);
+     glob subscriptions (`brain-relatorio-*`) match concrete channels;
+   - tables: `writes_to` / `reads_from` between file nodes and a shared `table:workspace/<schema.table>` node, only when
+     ≥ 2 members touch the same table.
+5. Write `<workspaceRoot>/.ua/contracts-report.json`: per member pair counts, resolved/unresolved/unmatched consumers with
+   reasons (`no-binding`, `external`, `no-route`, `method-mismatch`), providers with zero consumers (possible dead endpoints),
+   and coverage `linked / (consumers with a non-external target)`.
+
+The linker is idempotent: re-running it on the same inputs yields byte-identical output.
