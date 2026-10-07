@@ -1613,5 +1613,153 @@ class TestIncrementalEdgeCandidates(unittest.TestCase):
         }])
 
 
+# ── Node `type` and `lineRange` normalization ─────────────────────────────
+
+def _fn_node(node_id: str, **extra: Any) -> dict[str, Any]:
+    node: dict[str, Any] = {
+        "id": node_id,
+        "type": "function",
+        "name": node_id.rsplit(":", 1)[-1],
+        "filePath": "src/a.ts",
+        "summary": "Does a thing that is described at length.",
+        "tags": [],
+        "complexity": "simple",
+    }
+    node.update(extra)
+    return node
+
+
+def _section(report: list[str], title: str) -> list[str]:
+    """Lines of the report section whose header starts with `title`."""
+    out: list[str] = []
+    inside = False
+    for line in report:
+        if line.startswith(title):
+            inside = True
+            continue
+        if inside:
+            if not line.strip():
+                break
+            out.append(line)
+    return out
+
+
+class NormalizeLineRangeTests(unittest.TestCase):
+    def test_valid_tuple_unchanged(self) -> None:
+        self.assertEqual(mbg.normalize_line_range([12, 40]), ([12, 40], "valid"))
+
+    def test_string_dash_variants(self) -> None:
+        for raw in ("12-40", "12–40", "12—40", "12..40", "12:40", "L12-40", "L12-L40", " 12 - 40 "):
+            value, status = mbg.normalize_line_range(raw)
+            self.assertEqual(value, [12, 40], raw)
+            self.assertNotIn(status, ("valid", "unparseable"), raw)
+
+    def test_numeric_string_items(self) -> None:
+        value, status = mbg.normalize_line_range(["12", "40"])
+        self.assertEqual(value, [12, 40])
+        self.assertNotIn(status, ("valid", "unparseable"))
+
+    def test_single_number(self) -> None:
+        self.assertEqual(mbg.normalize_line_range(7)[0], [7, 7])
+        self.assertEqual(mbg.normalize_line_range("7")[0], [7, 7])
+        self.assertEqual(mbg.normalize_line_range("L7")[0], [7, 7])
+
+    def test_object_forms(self) -> None:
+        self.assertEqual(mbg.normalize_line_range({"start": 3, "end": 9})[0], [3, 9])
+        self.assertEqual(mbg.normalize_line_range({"startLine": "3", "endLine": 9})[0], [3, 9])
+
+    def test_reversed_is_swapped(self) -> None:
+        self.assertEqual(mbg.normalize_line_range([40, 12])[0], [12, 40])
+        self.assertEqual(mbg.normalize_line_range("40-12")[0], [12, 40])
+
+    def test_unparseable(self) -> None:
+        for raw in ("somewhere", [1, 2, 3], {"a": 1}, ["x", "y"], True, ""):
+            value, status = mbg.normalize_line_range(raw)
+            self.assertIsNone(value, repr(raw))
+            self.assertEqual(status, "unparseable", repr(raw))
+
+
+class MergeTypeAndLineRangeTests(unittest.TestCase):
+    def test_invalid_type_recovered_from_id_prefix_and_prose_moved(self) -> None:
+        bogus = "Handles the login flow and refreshes tokens"
+        node = _fn_node("class:src/a.ts:Auth", type=bogus, summary="")
+        edge_target = _fn_node("function:src/a.ts:helper")
+        batch = {
+            "nodes": [node, edge_target],
+            "edges": [{"source": "class:src/a.ts:Auth", "target": "function:src/a.ts:helper",
+                       "type": "calls", "direction": "forward", "weight": 0.5}],
+        }
+        assembled, report = mbg.merge_and_normalize([batch])
+        out = next(n for n in assembled["nodes"] if n["id"] == "class:src/a.ts:Auth")
+        self.assertEqual(out["type"], "class")
+        self.assertEqual(out["summary"], bogus)
+        self.assertEqual(len(assembled["edges"]), 1)
+        fixed = "\n".join(_section(report, "Fixed"))
+        self.assertIn("type", fixed)
+        self.assertIn("id prefix", fixed)
+        self.assertIn("summary", fixed)
+        self.assertEqual(_section(report, "Could not fix"), [])
+
+    def test_project_prefixed_id_and_func_prefix(self) -> None:
+        a = _fn_node("demo:class:src/a.ts:A", type="weird")
+        b = _fn_node("func:src/a.ts:b", type="weird")
+        assembled, _report = mbg.merge_and_normalize([{"nodes": [a, b], "edges": []}])
+        types = {n["id"]: n["type"] for n in assembled["nodes"]}
+        self.assertEqual(types["class:src/a.ts:A"], "class")
+        self.assertEqual(types["function:src/a.ts:b"], "function")
+
+    def test_prose_not_moved_over_real_summary(self) -> None:
+        summary = "A real, sufficiently long summary of the node."
+        node = _fn_node("class:src/a.ts:A", type="some prose text here", summary=summary)
+        assembled, _ = mbg.merge_and_normalize([{"nodes": [node], "edges": []}])
+        self.assertEqual(assembled["nodes"][0]["summary"], summary)
+        self.assertEqual(assembled["nodes"][0]["type"], "class")
+
+    def test_type_case_is_fixed(self) -> None:
+        node = _fn_node("class:src/a.ts:A", type="Class")
+        assembled, _ = mbg.merge_and_normalize([{"nodes": [node], "edges": []}])
+        self.assertEqual(assembled["nodes"][0]["type"], "class")
+
+    def test_unresolvable_type_kept_and_reported(self) -> None:
+        node = _fn_node("widget:src/a.ts:A", type="gizmo")
+        assembled, report = mbg.merge_and_normalize([{"nodes": [node], "edges": []}])
+        self.assertEqual(len(assembled["nodes"]), 1)
+        self.assertEqual(assembled["nodes"][0]["type"], "gizmo")
+        self.assertIn('unknown node type "gizmo"', "\n".join(_section(report, "Could not fix")))
+
+    def test_valid_type_untouched(self) -> None:
+        node = _fn_node("function:src/a.ts:f")
+        assembled, report = mbg.merge_and_normalize([{"nodes": [node], "edges": []}])
+        self.assertEqual(assembled["nodes"][0]["type"], "function")
+        self.assertEqual(_section(report, "Fixed"), [])
+
+    def test_line_range_fixed_and_reported(self) -> None:
+        nodes = [
+            _fn_node("function:src/a.ts:s", lineRange="12-40"),
+            _fn_node("function:src/a.ts:o", lineRange={"start": 5, "end": 1}),
+            _fn_node("function:src/a.ts:n", lineRange=9),
+            _fn_node("function:src/a.ts:v", lineRange=[1, 2]),
+        ]
+        assembled, report = mbg.merge_and_normalize([{"nodes": nodes, "edges": []}])
+        ranges = {n["id"].rsplit(":", 1)[-1]: n.get("lineRange") for n in assembled["nodes"]}
+        self.assertEqual(ranges, {"s": [12, 40], "o": [1, 5], "n": [9, 9], "v": [1, 2]})
+        fixed = _section(report, "Fixed")
+        self.assertEqual(sum(int(line.split("×")[0]) for line in fixed if "lineRange" in line), 3)
+        header = next(line for line in report if line.startswith("Fixed"))
+        self.assertIn("(3 corrections)", header)
+
+    def test_unparseable_line_range_dropped_and_reported(self) -> None:
+        node = _fn_node("function:src/a.ts:f", lineRange="near the top")
+        assembled, report = mbg.merge_and_normalize([{"nodes": [node], "edges": []}])
+        self.assertNotIn("lineRange", assembled["nodes"][0])
+        self.assertIn("lineRange", "\n".join(_section(report, "Could not fix")))
+
+    def test_null_line_range_left_alone(self) -> None:
+        node = _fn_node("function:src/a.ts:f", lineRange=None)
+        assembled, report = mbg.merge_and_normalize([{"nodes": [node], "edges": []}])
+        self.assertIsNone(assembled["nodes"][0]["lineRange"])
+        self.assertEqual(_section(report, "Fixed"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

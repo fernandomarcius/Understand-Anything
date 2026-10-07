@@ -15,7 +15,8 @@
  *   - every data endpoint requires the one-time ?token= printed at startup
  *   - graph JSON is served with node filePaths relativised to the project
  *   - /file-content.json only serves files listed in the graph, capped at
- *     1 MB, never binary
+ *     1 MB, never binary; for workspace graphs (project.workspace.members)
+ *     `M/rel/path` is confined to member M (see file-access.mjs)
  */
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
@@ -23,7 +24,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getGraphFreshnessBatch } from "./dist/staleness.js";
+import { getGraphFreshnessBatch, getWorkspaceFreshness } from "./dist/staleness.js";
+import {
+  resolveWorkspaceFilePath,
+  workspaceFreshnessGraph,
+  workspaceMembersFromGraph,
+} from "./file-access.mjs";
 
 const DIST_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist");
 const MAX_SOURCE_FILE_BYTES = 1024 * 1024;
@@ -141,11 +147,60 @@ function detectLanguage(filePath) {
   return byExt[ext] ?? "text";
 }
 
+function rejectFileRequest(message, statusCode = 400) {
+  return { statusCode, payload: { error: message } };
+}
+
+function readWorkspaceMembers() {
+  try {
+    return workspaceMembersFromGraph(
+      JSON.parse(fs.readFileSync(path.join(graphDir, "knowledge-graph.json"), "utf-8")),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function readAllowedSourceFile(absoluteFile, safeRelativePath) {
+  let stat;
+  try {
+    stat = fs.statSync(absoluteFile);
+  } catch {
+    return rejectFileRequest("File not found", 404);
+  }
+  if (!stat.isFile()) return rejectFileRequest("Path is not a file");
+  if (stat.size > MAX_SOURCE_FILE_BYTES) return rejectFileRequest("File is too large to preview", 413);
+
+  const buffer = fs.readFileSync(absoluteFile);
+  if (buffer.includes(0)) return rejectFileRequest("Binary files cannot be previewed", 415);
+
+  const content = buffer.toString("utf8");
+  return {
+    statusCode: 200,
+    payload: {
+      path: safeRelativePath,
+      language: detectLanguage(safeRelativePath),
+      content,
+      sizeBytes: buffer.byteLength,
+      lineCount: content.length === 0 ? 0 : content.split(/\r\n|\n|\r/).length,
+    },
+  };
+}
+
 function readSourceFile(url) {
-  const reject = (message, statusCode = 400) => ({ statusCode, payload: { error: message } });
+  const reject = rejectFileRequest;
   const requestedPath = url.searchParams.get("path") ?? "";
   if (!requestedPath) return reject("Missing path");
   if (requestedPath.includes("\0")) return reject("Invalid path");
+
+  // Workspace graphs: the first segment selects a member (see file-access.mjs).
+  const members = readWorkspaceMembers();
+  if (members) {
+    const resolved = resolveWorkspaceFilePath(requestedPath, projectRoot, members, graphFilePathSet());
+    if (!resolved.ok) return reject(resolved.error, resolved.statusCode);
+    return readAllowedSourceFile(resolved.absoluteFile, resolved.safeRelativePath);
+  }
+
   if (path.isAbsolute(requestedPath)) return reject("Absolute paths are not allowed");
 
   const normalizedPath = path.normalize(requestedPath);
@@ -173,29 +228,7 @@ function readSourceFile(url) {
     return reject("File is not in the knowledge graph", 404);
   }
 
-  let stat;
-  try {
-    stat = fs.statSync(absoluteFile);
-  } catch {
-    return reject("File not found", 404);
-  }
-  if (!stat.isFile()) return reject("Path is not a file");
-  if (stat.size > MAX_SOURCE_FILE_BYTES) return reject("File is too large to preview", 413);
-
-  const buffer = fs.readFileSync(absoluteFile);
-  if (buffer.includes(0)) return reject("Binary files cannot be previewed", 415);
-
-  const content = buffer.toString("utf8");
-  return {
-    statusCode: 200,
-    payload: {
-      path: safeRelativePath,
-      language: detectLanguage(relativeToRoot),
-      content,
-      sizeBytes: buffer.byteLength,
-      lineCount: content.length === 0 ? 0 : content.split(/\r\n|\n|\r/).length,
-    },
-  };
+  return readAllowedSourceFile(absoluteFile, safeRelativePath);
 }
 
 function serveGraphJson(res, fileName) {
@@ -231,10 +264,11 @@ function serveGraphJson(res, fileName) {
   }
 }
 
-function readGraphMetadata(fileName) {
-  const graph = JSON.parse(
-    fs.readFileSync(path.join(graphDir, fileName), "utf-8"),
-  );
+function readGraphJson(fileName) {
+  return JSON.parse(fs.readFileSync(path.join(graphDir, fileName), "utf-8"));
+}
+
+function graphMetadata(graph) {
   return {
     graphCommitHash:
       typeof graph.project?.gitCommitHash === "string"
@@ -257,12 +291,14 @@ async function readGraphFreshness() {
   }
 
   const domainGraph = path.join(graphDir, "domain-graph.json");
+  let knowledge;
   let inputs;
   try {
+    knowledge = readGraphJson("knowledge-graph.json");
     inputs = {
-      knowledge: readGraphMetadata("knowledge-graph.json"),
+      knowledge: graphMetadata(knowledge),
       ...(fs.existsSync(domainGraph)
-        ? { domain: readGraphMetadata("domain-graph.json") }
+        ? { domain: graphMetadata(readGraphJson("domain-graph.json")) }
         : {}),
     };
   } catch {
@@ -272,12 +308,14 @@ async function readGraphFreshness() {
     };
   }
 
-  return {
-    statusCode: 200,
-    payload: {
-      graphs: await getGraphFreshnessBatch(projectRoot, inputs),
-    },
-  };
+  const payload = { graphs: await getGraphFreshnessBatch(projectRoot, inputs) };
+  // Multi-repo workspace graph: per-member freshness (docs/multi-repo-workspace.md).
+  const workspaceGraph = workspaceFreshnessGraph(knowledge);
+  if (workspaceGraph) {
+    const workspace = await getWorkspaceFreshness(projectRoot, workspaceGraph);
+    if (workspace) payload.workspace = workspace;
+  }
+  return { statusCode: 200, payload };
 }
 
 const CONTENT_TYPES = {

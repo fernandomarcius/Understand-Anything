@@ -8,9 +8,12 @@ import crypto from "crypto";
 import type { IncomingMessage, ServerResponse } from "http";
 import {
   getGraphFreshnessBatch,
+  getWorkspaceFreshness,
   type GraphFreshnessInput,
   type GraphFreshnessResult,
+  type WorkspaceFreshnessReport,
 } from "../core/src/staleness";
+import type { WorkspaceMeta } from "../core/src/types";
 
 // Generate a one-time token when the server process starts.
 // This token is printed to the terminal and must be in the URL
@@ -122,10 +125,161 @@ function rejectFileRequest(message: string, statusCode = 400) {
   return { statusCode, payload: { error: message } };
 }
 
-function readSourceFile(url: URL) {
+// ── Multi-repo workspace (docs/multi-repo-workspace.md) ─────────────────────
+// Same logic, same names as packages/viewer/bin/file-access.mjs (kept in sync).
+
+export interface WorkspaceMember {
+  name: string;
+  path: string;
+}
+
+export type WorkspaceFileResolution =
+  | { ok: true; absoluteFile: string; safeRelativePath: string }
+  | { ok: false; statusCode: number; error: string };
+
+const WORKSPACE_MEMBER_NAME = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * `project.workspace.members` of a parsed graph, or null when it is not a
+ * workspace graph. Malformed entries are dropped, so a request for them fails
+ * as an undeclared member.
+ */
+export function workspaceMembersFromGraph(graph: unknown): WorkspaceMember[] | null {
+  const project = (graph as { project?: unknown } | null)?.project;
+  const workspace = (project as { workspace?: unknown } | null | undefined)?.workspace;
+  const members = (workspace as { members?: unknown } | null | undefined)?.members;
+  if (!Array.isArray(members)) return null;
+  const valid: WorkspaceMember[] = [];
+  for (const member of members as unknown[]) {
+    const { name, path: memberPath } = (member ?? {}) as { name?: unknown; path?: unknown };
+    if (
+      typeof name === "string" &&
+      WORKSPACE_MEMBER_NAME.test(name) &&
+      typeof memberPath === "string" &&
+      memberPath.length > 0 &&
+      !memberPath.includes("\0")
+    ) {
+      valid.push({ name, path: memberPath });
+    }
+  }
+  return valid;
+}
+
+function isStrictlyInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative.length > 0 &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+/**
+ * Resolve a workspace request `M/rel/path` (`workspaceRoot` = directory that
+ * contains `.ua/`). Rejections are 403, except a missing file (404). The
+ * returned `absoluteFile` is the real path, already confined to the member.
+ */
+export function resolveWorkspaceFilePath(
+  requestedPath: string,
+  workspaceRoot: string,
+  members: readonly WorkspaceMember[],
+  allowedPaths: ReadonlySet<string>,
+): WorkspaceFileResolution {
+  const forbidden = (error: string): WorkspaceFileResolution => ({
+    ok: false,
+    statusCode: 403,
+    error,
+  });
+  const outside = "Path must stay inside a workspace member";
+  if (
+    !requestedPath ||
+    requestedPath.includes("\0") ||
+    requestedPath.includes("\\") ||
+    path.isAbsolute(requestedPath)
+  ) {
+    return forbidden(outside);
+  }
+  const segments = requestedPath.split("/");
+  if (segments.length < 2 || segments.some((s) => s === "" || s === "." || s === "..")) {
+    return forbidden(outside);
+  }
+  const member = members.find((m) => m.name === segments[0]);
+  if (!member) return forbidden("Unknown workspace member");
+  if (!allowedPaths.has(requestedPath)) return forbidden("File is not in the knowledge graph");
+
+  const memberRoot = path.resolve(workspaceRoot, member.path);
+  const absoluteFile = path.resolve(memberRoot, ...segments.slice(1));
+  if (!isStrictlyInside(memberRoot, absoluteFile)) return forbidden(outside);
+
+  let realFile: string;
+  try {
+    const realRoot = fs.realpathSync(memberRoot);
+    realFile = fs.realpathSync(absoluteFile);
+    if (!isStrictlyInside(realRoot, realFile)) return forbidden(outside);
+  } catch {
+    return { ok: false, statusCode: 404, error: "File not found" };
+  }
+  return { ok: true, absoluteFile: realFile, safeRelativePath: requestedPath };
+}
+
+function readWorkspaceMembers(graphFile: string): WorkspaceMember[] | null {
+  try {
+    return workspaceMembersFromGraph(JSON.parse(fs.readFileSync(graphFile, "utf-8")));
+  } catch {
+    return null;
+  }
+}
+
+function readAllowedSourceFile(absoluteFile: string, safeRelativePath: string) {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(absoluteFile);
+  } catch {
+    return rejectFileRequest("File not found", 404);
+  }
+
+  if (!stat.isFile()) return rejectFileRequest("Path is not a file");
+  if (stat.size > MAX_SOURCE_FILE_BYTES) {
+    return rejectFileRequest("File is too large to preview", 413);
+  }
+
+  const buffer = fs.readFileSync(absoluteFile);
+  if (buffer.includes(0)) return rejectFileRequest("Binary files cannot be previewed", 415);
+
+  const content = buffer.toString("utf8");
+  return {
+    statusCode: 200,
+    payload: {
+      path: safeRelativePath,
+      language: detectLanguage(safeRelativePath),
+      content,
+      sizeBytes: buffer.byteLength,
+      lineCount: content.length === 0 ? 0 : content.split(/\r\n|\n|\r/).length,
+    },
+  };
+}
+
+export function readSourceFile(url: URL) {
   const requestedPath = url.searchParams.get("path") ?? "";
   if (!requestedPath) return rejectFileRequest("Missing path");
   if (requestedPath.includes("\0")) return rejectFileRequest("Invalid path");
+
+  // Workspace graphs: the first segment selects a member (see helper above).
+  const workspaceGraphFile = findGraphFile("knowledge-graph.json");
+  const members = workspaceGraphFile ? readWorkspaceMembers(workspaceGraphFile) : null;
+  if (workspaceGraphFile && members) {
+    const workspaceRoot = projectRootFromGraphFile(workspaceGraphFile);
+    const resolved = resolveWorkspaceFilePath(
+      requestedPath,
+      workspaceRoot,
+      members,
+      graphFilePathSet(workspaceGraphFile, workspaceRoot),
+    );
+    if (!resolved.ok) return rejectFileRequest(resolved.error, resolved.statusCode);
+    return readAllowedSourceFile(resolved.absoluteFile, resolved.safeRelativePath);
+  }
+
   if (path.isAbsolute(requestedPath)) return rejectFileRequest("Absolute paths are not allowed");
 
   const normalizedPath = path.normalize(requestedPath);
@@ -159,32 +313,7 @@ function readSourceFile(url: URL) {
     return rejectFileRequest("File is not in the knowledge graph", 404);
   }
 
-  let stat: fs.Stats;
-  try {
-    stat = fs.statSync(absoluteFile);
-  } catch {
-    return rejectFileRequest("File not found", 404);
-  }
-
-  if (!stat.isFile()) return rejectFileRequest("Path is not a file");
-  if (stat.size > MAX_SOURCE_FILE_BYTES) {
-    return rejectFileRequest("File is too large to preview", 413);
-  }
-
-  const buffer = fs.readFileSync(absoluteFile);
-  if (buffer.includes(0)) return rejectFileRequest("Binary files cannot be previewed", 415);
-
-  const content = buffer.toString("utf8");
-  return {
-    statusCode: 200,
-    payload: {
-      path: safeRelativePath,
-      language: detectLanguage(relativeToRoot),
-      content,
-      sizeBytes: buffer.byteLength,
-      lineCount: content.length === 0 ? 0 : content.split(/\r\n|\n|\r/).length,
-    },
-  };
+  return readAllowedSourceFile(absoluteFile, safeRelativePath);
 }
 
 export interface DashboardFreshnessReport {
@@ -192,10 +321,62 @@ export interface DashboardFreshnessReport {
     knowledge: GraphFreshnessResult;
     domain?: GraphFreshnessResult;
   };
+  /** Per-member freshness; present only for multi-repo workspace graphs. */
+  workspace?: WorkspaceFreshnessReport;
 }
 
-function readGraphMetadata(graphFile: string): GraphFreshnessInput {
-  const graph = JSON.parse(fs.readFileSync(graphFile, "utf-8")) as {
+/**
+ * The `project.workspace` block of a parsed graph, sanitized for
+ * `getWorkspaceFreshness` (malformed members dropped, a non-string
+ * `gitCommitHash` becomes "" → reported as `missing-graph-commit`), or null
+ * when it is not a workspace graph.
+ */
+export function workspaceFreshnessGraph(
+  graph: unknown,
+): { project: { workspace: WorkspaceMeta } } | null {
+  const project = (graph as { project?: unknown } | null)?.project;
+  const workspace = (project as { workspace?: unknown } | null | undefined)?.workspace as
+    | { name?: unknown; members?: unknown }
+    | null
+    | undefined;
+  if (!workspace || !Array.isArray(workspace.members)) return null;
+  const members: WorkspaceMeta["members"] = [];
+  for (const member of workspace.members as unknown[]) {
+    const { name, path: memberPath, gitCommitHash } = (member ?? {}) as {
+      name?: unknown;
+      path?: unknown;
+      gitCommitHash?: unknown;
+    };
+    if (
+      typeof name !== "string" ||
+      !WORKSPACE_MEMBER_NAME.test(name) ||
+      typeof memberPath !== "string" ||
+      memberPath.length === 0 ||
+      memberPath.includes("\0")
+    ) {
+      continue;
+    }
+    members.push({
+      name,
+      path: memberPath,
+      gitCommitHash: typeof gitCommitHash === "string" ? gitCommitHash : "",
+      analyzedAt: "",
+      nodes: 0,
+      edges: 0,
+    });
+  }
+  return {
+    project: {
+      workspace: {
+        name: typeof workspace.name === "string" ? workspace.name : "",
+        members,
+      },
+    },
+  };
+}
+
+function graphMetadata(graph: unknown): GraphFreshnessInput {
+  const { project } = graph as {
     project?: {
       gitCommitHash?: unknown;
       analyzedAt?: unknown;
@@ -203,14 +384,18 @@ function readGraphMetadata(graphFile: string): GraphFreshnessInput {
   };
   return {
     graphCommitHash:
-      typeof graph.project?.gitCommitHash === "string"
-        ? graph.project.gitCommitHash
+      typeof project?.gitCommitHash === "string"
+        ? project.gitCommitHash
         : undefined,
     lastAnalyzedAt:
-      typeof graph.project?.analyzedAt === "string"
-        ? graph.project.analyzedAt
+      typeof project?.analyzedAt === "string"
+        ? project.analyzedAt
         : undefined,
   };
+}
+
+function readGraphJson(graphFile: string): unknown {
+  return JSON.parse(fs.readFileSync(graphFile, "utf-8"));
 }
 
 export async function readGraphFreshness() {
@@ -220,12 +405,14 @@ export async function readGraphFreshness() {
   }
 
   const domainGraphFile = path.join(path.dirname(graphFile), "domain-graph.json");
+  let knowledgeGraph: unknown;
   let knowledgeInput: GraphFreshnessInput;
   let domainInput: GraphFreshnessInput | undefined;
   try {
-    knowledgeInput = readGraphMetadata(graphFile);
+    knowledgeGraph = readGraphJson(graphFile);
+    knowledgeInput = graphMetadata(knowledgeGraph);
     domainInput = fs.existsSync(domainGraphFile)
-      ? readGraphMetadata(domainGraphFile)
+      ? graphMetadata(readGraphJson(domainGraphFile))
       : undefined;
   } catch {
     return rejectFileRequest("Failed to read graph file", 500);
@@ -245,10 +432,14 @@ export async function readGraphFreshness() {
     graphs = { knowledge: result.knowledge };
   }
 
-  return {
-    statusCode: 200,
-    payload: { graphs } satisfies DashboardFreshnessReport,
-  };
+  const payload: DashboardFreshnessReport = { graphs };
+  const workspaceGraph = workspaceFreshnessGraph(knowledgeGraph);
+  if (workspaceGraph) {
+    const workspace = await getWorkspaceFreshness(projectRoot, workspaceGraph);
+    if (workspace) payload.workspace = workspace;
+  }
+
+  return { statusCode: 200, payload };
 }
 
 type DashboardDataMiddleware = (
@@ -308,6 +499,7 @@ const config: DashboardViteConfig = {
       "@understand-anything/core/schema": path.resolve(__dirname, "../core/dist/schema.js"),
       "@understand-anything/core/search": path.resolve(__dirname, "../core/dist/search.js"),
       "@understand-anything/core/types": path.resolve(__dirname, "../core/dist/types.js"),
+      "@understand-anything/core/workspace": path.resolve(__dirname, "../core/dist/workspace.js"),
     },
   },
 

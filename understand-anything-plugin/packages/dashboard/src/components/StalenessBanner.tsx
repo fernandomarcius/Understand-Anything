@@ -1,11 +1,14 @@
 import { useState } from "react";
+import { useI18n } from "../contexts/I18nContext";
+import { en, type Locale } from "../locales";
 import type {
   DashboardFreshnessReport,
   GraphFreshnessResult,
   GraphFreshnessUnknownReason,
+  WorkspaceFreshnessReport,
 } from "../freshness";
-import { useI18n } from "../contexts/I18nContext";
-import { en, type Locale } from "../locales";
+
+type BannerStrings = Locale["stalenessBanner"];
 
 interface StalenessBannerProps {
   freshness: DashboardFreshnessReport | null;
@@ -81,11 +84,62 @@ function refreshAction(t: Locale, entries: GraphEntry[]): string {
   return t.staleness.refresh(commands, entries.length !== 1);
 }
 
+function fill(template: string, values: Record<string, string | number>): string {
+  return template.replace(/\{(\w+)\}/g, (match, key: string) =>
+    key in values ? String(values[key]) : match,
+  );
+}
+
+// Workspace graphs: the root-level `graphs` result is meaningless (the root is
+// usually not a Git repo and its hash is synthetic), so report per member.
+function buildWorkspaceBanner(
+  workspace: WorkspaceFreshnessReport,
+  strings: BannerStrings,
+): FreshnessBannerContent | null {
+  const total = workspace.members.length;
+  const stale = workspace.members.filter((m) => m.status === "stale");
+  const unknown = workspace.members.filter((m) => m.status === "unknown");
+  if (stale.length === 0 && unknown.length === 0) return null;
+
+  const names = (members: typeof stale) => members.map((m) => m.name).join(", ");
+  const unknownSentence = unknown.length
+    ? fill(strings.workspaceUnknownSummary, {
+        count: unknown.length,
+        total,
+        names: names(unknown),
+      })
+    : "";
+
+  if (stale.length > 0) {
+    const staleSentence = fill(strings.workspaceStaleSummary, {
+      count: stale.length,
+      total,
+      names: names(stale),
+    });
+    return {
+      title: strings.workspaceStaleTitle,
+      summary: [staleSentence, unknownSentence].filter(Boolean).join(" "),
+      action: strings.workspaceAction,
+      changedFiles: [],
+    };
+  }
+
+  return {
+    title: strings.workspaceUnknownTitle,
+    summary: unknownSentence,
+    action: strings.workspaceUnknownAction,
+    changedFiles: [],
+  };
+}
+
 export function buildFreshnessBanner(
   freshness: DashboardFreshnessReport | null,
   t: Locale = en,
 ): FreshnessBannerContent | null {
   if (!freshness) return null;
+  if (freshness.workspace) {
+    return buildWorkspaceBanner(freshness.workspace, t.stalenessBanner);
+  }
   const entries: GraphEntry[] = [
     { name: "knowledge", result: freshness.graphs.knowledge },
   ];

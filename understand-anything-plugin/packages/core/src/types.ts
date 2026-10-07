@@ -66,6 +66,17 @@ export interface GraphNode {
   figmaMeta?: FigmaMeta;
 }
 
+/**
+ * Where a cross-service link was found (multi-repo workspace graphs, written by
+ * the contract linker). Locations are workspace-namespaced `M/file:line`.
+ */
+export interface CrossServiceEvidence {
+  consumer?: string;
+  provider?: string;
+  via?: string;
+  [key: string]: unknown;
+}
+
 // GraphEdge with rich relationship modeling
 export interface GraphEdge {
   source: string;
@@ -74,6 +85,13 @@ export interface GraphEdge {
   direction: "forward" | "backward" | "bidirectional";
   description?: string;
   weight: number; // 0-1
+  /** Contract-linker edges between two workspace members (see docs/multi-repo-workspace.md). */
+  crossService?: boolean;
+  /** Linker confidence (0-1] of a cross-service link. */
+  confidence?: number;
+  evidence?: CrossServiceEvidence;
+  /** Number of call sites folded into this cross-service `calls` edge. */
+  callSites?: number;
 }
 
 // Layer (logical grouping)
@@ -93,6 +111,23 @@ export interface TourStep {
   languageLesson?: string;
 }
 
+// Workspace metadata (multi-repo workspace graphs only)
+export interface WorkspaceMemberMeta {
+  name: string;
+  /** Member path as written in ua-workspace.json (relative to the workspace root). */
+  path: string;
+  /** Member graph's project.gitCommitHash at merge time. */
+  gitCommitHash: string;
+  analyzedAt: string;
+  nodes: number;
+  edges: number;
+}
+
+export interface WorkspaceMeta {
+  name: string;
+  members: WorkspaceMemberMeta[];
+}
+
 // ProjectMeta
 export interface ProjectMeta {
   name: string;
@@ -101,6 +136,8 @@ export interface ProjectMeta {
   description: string;
   analyzedAt: string;
   gitCommitHash: string;
+  /** Present only when the graph is a merged multi-repo workspace. */
+  workspace?: WorkspaceMeta;
 }
 
 // Root KnowledgeGraph

@@ -1,0 +1,5 @@
+{
+  // CRA-style absolute imports
+  "compilerOptions": { "baseUrl": "./src", },
+  "include": ["src"]
+}

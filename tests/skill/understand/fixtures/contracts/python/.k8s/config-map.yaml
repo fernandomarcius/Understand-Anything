@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: motor-config
+data:
+  CFLOW_URL: "https://172.16.50.121:8443"
+  CFLOW_TOKEN: "supersecret-k8s-token"
+  LOG_LEVEL: "INFO"
+  TOPICOS: "cflow.executar=motor_referencias;cflow.antecipacao=antecipacao"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: motor
+spec:
+  template:
+    spec:
+      containers:
+        - name: motor
+          image: motor:1.0
+          ports:
+            - containerPort: 8089
+          env:
+            - name: CODEQ_URL
+              value: "http://codeq:8080"
+            - name: SENHA_DB
+              valueFrom:
+                secretKeyRef: { name: s, key: k }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: motor-svc
+spec:
+  ports:
+    - port: 80
+      targetPort: 8089

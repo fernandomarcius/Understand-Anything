@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -528,6 +528,179 @@ describe('extract-import-map.mjs — TypeScript / JavaScript resolver', () => {
     expect(result.output.importMap['src/app.ts']).toContain('lib/thing.ts');
   });
 
+  // ── baseUrl-relative bare specifiers + jsconfig.json ────────────────────
+  // TypeScript (and CRA/webpack via jsconfig/tsconfig) resolve a bare
+  // specifier against an explicit `baseUrl` when no `paths` alias matches:
+  // `baseUrl: "./src"` + `import x from 'api/client'` → src/api/client.js.
+  // A specifier only becomes an edge when the probed file exists in the
+  // project, so real packages (`react`) stay external.
+
+  it('resolves bare specifiers relative to an explicit tsconfig baseUrl', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: './src' } }),
+      'src/pages/Home.jsx': `import React from 'react';\nimport { get } from 'api/client';\nimport Card from 'components/Card';\n`,
+      'src/api/client.js': `export const get = () => 1;\n`,
+      'src/components/Card/index.jsx': `export default function Card() { return null; }\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/pages/Home.jsx', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/api/client.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/components/Card/index.jsx', language: 'javascript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/pages/Home.jsx']).toEqual([
+      'src/api/client.js',
+      'src/components/Card/index.jsx',
+    ]);
+  });
+
+  it('loads jsconfig.json like tsconfig.json for baseUrl resolution', () => {
+    projectRoot = setupTree({
+      'jsconfig.json': `{\n  // CRA jsconfig\n  "compilerOptions": { "baseUrl": "src" }\n}\n`,
+      'src/App.js': `import { get } from 'api/client';\n`,
+      'src/api/client.js': `export const get = () => 1;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'jsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/App.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/api/client.js', language: 'javascript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/App.js']).toEqual(['src/api/client.js']);
+  });
+
+  it('prefers tsconfig.json over jsconfig.json in the same directory', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: 'src' } }),
+      'jsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: 'lib' } }),
+      'src/App.js': `import { a } from 'util/a';\n`,
+      'src/util/a.js': `export const a = 1;\n`,
+      'lib/util/a.js': `export const a = 2;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'jsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/App.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/util/a.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'lib/util/a.js', language: 'javascript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/App.js']).toEqual(['src/util/a.js']);
+  });
+
+  it('lets a matching paths alias win over the baseUrl fallback', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({
+        compilerOptions: {
+          baseUrl: 'src',
+          paths: { 'utils/*': ['lib/utils/*'] },
+        },
+      }),
+      'src/app.ts': `import { f } from 'utils/format';\nimport { g } from 'services/api';\n`,
+      'src/utils/format.ts': `export const f = 1;\n`,
+      'src/lib/utils/format.ts': `export const f = 2;\n`,
+      'src/services/api.ts': `export const g = 3;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/app.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'src/utils/format.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'src/lib/utils/format.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'src/services/api.ts', language: 'typescript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/app.ts']).toEqual([
+      'src/lib/utils/format.ts',
+      'src/services/api.ts',
+    ]);
+  });
+
+  it('keeps a bare package external when baseUrl only has a same-named folder', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: './src' } }),
+      'src/App.js': `import React from 'react';\nimport moment from 'moment';\n`,
+      // A folder named like the package, but no react.js / react/index.js.
+      'src/react/hooks.js': `export const useX = () => 1;\n`,
+      'src/moment/README.md': `# not code\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/App.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/react/hooks.js', language: 'javascript', fileCategory: 'code' },
+        { path: 'src/moment/README.md', language: 'markdown', fileCategory: 'docs' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/App.js']).toEqual([]);
+  });
+
+  it('never resolves a baseUrl target that escapes the project root', () => {
+    projectRoot = setupTree({
+      'app/tsconfig.json': JSON.stringify({ compilerOptions: { baseUrl: '../..' } }),
+      'app/main.ts': `import { x } from 'app/thing';\n`,
+      'app/thing.ts': `export const x = 1;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'app/tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'app/main.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'app/thing.ts', language: 'typescript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['app/main.ts']).toEqual([]);
+  });
+
+  it('keeps bare specifiers external when no config sets baseUrl explicitly', () => {
+    projectRoot = setupTree({
+      'tsconfig.json': JSON.stringify({ compilerOptions: { paths: { '@/*': ['src/*'] } } }),
+      'src/app.ts': `import { b } from 'src/bar';\nimport { c } from 'bar';\n`,
+      'src/bar.ts': `export const b = 1;\n`,
+      'bar.ts': `export const c = 1;\n`,
+    });
+
+    const result = runScript(projectRoot, {
+      projectRoot,
+      files: [
+        { path: 'tsconfig.json', language: 'json', fileCategory: 'config' },
+        { path: 'src/app.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'src/bar.ts', language: 'typescript', fileCategory: 'code' },
+        { path: 'bar.ts', language: 'typescript', fileCategory: 'code' },
+      ],
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['src/app.ts']).toEqual([]);
+  });
+
   // ── #294: NodeNext / ESM TypeScript `.js → .ts` rewrite ────────────────
   //
   // Under `moduleResolution: NodeNext`, TypeScript does NOT rewrite import
@@ -769,12 +942,12 @@ describe('extract-import-map.mjs — Python resolver', () => {
 
     expect(result.status).toBe(0);
     // `import src.utils.formatter` -> src/utils/formatter.py
-    // `from src.utils import formatter` -> src/utils/__init__.py + src/utils/formatter.py
-    // `from src import config` -> src/__init__.py + src/config.py
+    // `from src.utils import formatter` -> src/utils/formatter.py
+    // `from src import config` -> src/config.py
+    // The (empty) `__init__.py` files do not define `formatter`/`config`, so
+    // they get no edge: the import targets the submodule, not the package.
     expect(result.output.importMap['main.py']).toEqual([
-      'src/__init__.py',
       'src/config.py',
-      'src/utils/__init__.py',
       'src/utils/formatter.py',
     ]);
   });
@@ -839,6 +1012,180 @@ describe('extract-import-map.mjs — Python resolver', () => {
     expect(result.output.importMap['src/svc_b/main.py']).not.toContain(
       'src/svc_a/helpers.py',
     );
+  });
+});
+
+describe('extract-import-map.mjs — Python packages, submodules and roots', () => {
+  let projectRoot;
+
+  afterEach(() => {
+    if (projectRoot) {
+      rmSync(projectRoot, { recursive: true, force: true });
+      projectRoot = null;
+    }
+  });
+
+  const pyFiles = paths => paths.map(path => ({
+    path,
+    language: path.endsWith('.py') ? 'python' : 'unknown',
+    fileCategory: path.endsWith('.py') ? 'code' : 'config',
+  }));
+
+  it('resolves relative imports of submodules (aliases, nested, multi-line) and links __init__.py only when it defines the name', () => {
+    const tree = {
+      'pkg/__init__.py': `from .api import publico\n__all__ = ['publico', 'reexport']\nreexport = 1\n`,
+      'pkg/api.py': `publico = 1\n`,
+      'pkg/ingestao/__init__.py': `# pacote\n`,
+      'pkg/ingestao/repositorio.py': `x = 1\n`,
+      'pkg/ingestao/motor.py': `def rodar(): pass\ndef parar(): pass\n`,
+      'pkg/ingestao/fake.py': `x = 1\n`,
+      'pkg/ingestao/leitura.py': [
+        '"""Docstring citing code.',
+        '',
+        'from .fake import x',
+        '"""',
+        'from . import repositorio as repo',
+        'from .. import reexport',
+        'from ..ingestao import repositorio',
+        '',
+        'def f():',
+        '    from .motor import (',
+        '        rodar,',
+        '        parar as p,',
+        '    )',
+        '    return repo, rodar, p',
+        '',
+      ].join('\n'),
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    // `from . import repositorio as repo` -> the submodule, despite the alias.
+    // `from .. import reexport` -> pkg/__init__.py (the name lives there).
+    // `from ..ingestao import repositorio` -> only the submodule: the
+    //   ingestao/__init__.py does not define `repositorio`.
+    // Function-local multi-line `from .motor import (...)` -> motor.py.
+    // The docstring's `from .fake import x` is text, not an import.
+    expect(result.output.importMap['pkg/ingestao/leitura.py']).toEqual([
+      'pkg/__init__.py',
+      'pkg/ingestao/motor.py',
+      'pkg/ingestao/repositorio.py',
+    ]);
+    // `from .api import publico` inside __init__.py -> pkg/api.py.
+    expect(result.output.importMap['pkg/__init__.py']).toEqual(['pkg/api.py']);
+  });
+
+  it('parses compact import forms (`import*`, `from .import x`, `if X: import y`)', () => {
+    const tree = {
+      'libs.py': `x = 1\n`,
+      'app/__init__.py': ``,
+      'app/creds.py': `x = 1\n`,
+      'app/util.py': `x = 1\n`,
+      'app/tipos.py': `x = 1\n`,
+      'app/main.py':
+        `from libs import*\nfrom .import creds\nfrom.util import(x)\nif TYPE_CHECKING: from . import tipos\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['app/main.py']).toEqual([
+      'app/creds.py',
+      'app/tipos.py',
+      'app/util.py',
+      'libs.py',
+    ]);
+  });
+
+  it('resolves absolute imports of src-layout packages across a multi-package monorepo', () => {
+    const tree = {
+      'core/pyproject.toml': `[project]\nname = "acme-core"\n\n[tool.hatch.build.targets.wheel]\npackages = ["src/acme_core"]\n`,
+      'core/src/acme_core/__init__.py': ``,
+      'core/src/acme_core/db.py': `def transacao(): pass\n`,
+      'core/src/acme_core/auth/__init__.py': ``,
+      'core/src/acme_core/auth/sessoes.py': `x = 1\n`,
+      'api/pyproject.toml': `[project]\nname = "acme-api"\n`,
+      'api/src/acme_api/__init__.py': ``,
+      'api/src/acme_api/deps.py':
+        `from acme_core.auth import sessoes\nfrom acme_core.db import transacao\nimport acme_core.db\n`,
+      'api/tests/test_deps.py': `def test_x():\n    from acme_api.deps import sessoes\n    assert sessoes\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['api/src/acme_api/deps.py']).toEqual([
+      'core/src/acme_core/auth/sessoes.py',
+      'core/src/acme_core/db.py',
+    ]);
+    expect(result.output.importMap['api/tests/test_deps.py']).toEqual([
+      'api/src/acme_api/deps.py',
+    ]);
+  });
+
+  it('resolves two packages importing each other via setuptools where= and pytest pythonpath', () => {
+    const tree = {
+      'pyproject.toml': `[tool.pytest.ini_options]\npythonpath = ["libs/beta"]\n`,
+      'libs/alpha/setup.cfg': `[metadata]\nname = alpha\n\n[options.packages.find]\nwhere = lib\n`,
+      'libs/alpha/lib/alpha/__init__.py': ``,
+      'libs/alpha/lib/alpha/core.py': `from beta import util\n\ndef run(): pass\n`,
+      'libs/beta/beta/__init__.py': ``,
+      'libs/beta/beta/util.py': `from alpha.core import run\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['libs/alpha/lib/alpha/core.py']).toEqual([
+      'libs/beta/beta/util.py',
+    ]);
+    expect(result.output.importMap['libs/beta/beta/util.py']).toEqual([
+      'libs/alpha/lib/alpha/core.py',
+    ]);
+  });
+
+  it('infers the root of a top-level package only when several files import it', () => {
+    const tree = {
+      'tools/motor/__init__.py': ``,
+      'tools/motor/calc.py': `x = 1\n`,
+      'tools/lonely/__init__.py': ``,
+      'tools/lonely/mod.py': `x = 1\n`,
+      'a/tests/test_a.py': `from motor import calc\nfrom lonely import mod\n`,
+      'b/tests/test_b.py': `import motor.calc\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    // `motor` is imported from two files -> `tools/` becomes a root for it.
+    // `lonely` is imported from one file only -> no inferred root, external.
+    expect(result.output.importMap['a/tests/test_a.py']).toEqual(['tools/motor/calc.py']);
+    expect(result.output.importMap['b/tests/test_b.py']).toEqual(['tools/motor/calc.py']);
+  });
+
+  it('keeps stdlib and third-party names external even when a local folder matches', () => {
+    const tree = {
+      'pyproject.toml': `[project]\nname = "app"\n`,
+      'vendor/json/__init__.py': ``,
+      'vendor/json/decoder.py': `x = 1\n`,
+      'vendor/logging/__init__.py': ``,
+      'lib/pyproject.toml': `[project]\nname = "lib"\n`,
+      'lib/src/json/__init__.py': ``,
+      'lib/src/json/decoder.py': `x = 1\n`,
+      'mcp/pyproject.toml': `[project]\nname = "x-mcp"\n`,
+      'mcp/src/x_mcp/__init__.py': ``,
+      'mcp/src/x_mcp/server.py': `from mcp.server.fastmcp import FastMCP\nimport mcp\n`,
+      'app/a.py': `import json\nfrom json import decoder\nimport logging\n`,
+      'app/b.py': `import json\nfrom json import decoder\nimport logging\n`,
+    };
+    projectRoot = setupTree(tree);
+    const result = runScript(projectRoot, { projectRoot, files: pyFiles(Object.keys(tree)) });
+
+    expect(result.status).toBe(0);
+    expect(result.output.importMap['app/a.py']).toEqual([]);
+    expect(result.output.importMap['app/b.py']).toEqual([]);
+    expect(result.output.importMap['mcp/src/x_mcp/server.py']).toEqual([]);
   });
 });
 
@@ -1232,6 +1579,96 @@ describe('extract-import-map.mjs — C# resolver', () => {
       'MyApp/Models/User.cs',
       'MyApp/Util/Helper.cs',
     ]);
+  });
+
+  // Fixture: a two-project solution (Shop.Core + Shop.Api) whose namespaces
+  // do NOT mirror the directory layout, exercising namespace-based resolution.
+  const CS_FIXTURE = resolve(__dirname, 'fixtures/csharp-solution');
+  const CS_FILES = [
+    'Shop.sln',
+    'Shop.Core/Shop.Core.csproj',
+    'Shop.Core/GlobalUsings.cs',
+    'Shop.Core/Common/Guard.cs',
+    'Shop.Core/Domain/Order.cs',
+    'Shop.Core/Domain/Money.cs',
+    'Shop.Core/Domain/UnusedPolicy.cs',
+    'Shop.Core/Math/Calc.cs',
+    'Shop.Core/Infra.cs',
+    'Shop.Core/Migrations/20240101_Init.Designer.cs',
+    'Shop.Api/Shop.Api.csproj',
+    'Shop.Api/AppSettings.cs',
+    'Shop.Api/Controllers/OrdersController.cs',
+    'Shop.Api/obj/Debug/net8.0/Shop.Api.AssemblyInfo.cs',
+  ];
+
+  function csInventory() {
+    return CS_FILES.map(path => {
+      if (path.endsWith('.cs')) return { path, language: 'csharp', fileCategory: 'code' };
+      if (path.endsWith('.csproj')) return { path, language: 'csproj', fileCategory: 'config' };
+      return { path, language: 'unknown', fileCategory: 'config' };
+    });
+  }
+
+  function runCsFixture(extraInput = {}) {
+    projectRoot = mkdtempSync(join(tmpdir(), 'ua-eim-cs-'));
+    cpSync(CS_FIXTURE, projectRoot, { recursive: true });
+    return runScript(projectRoot, { projectRoot, files: csInventory(), ...extraInput });
+  }
+
+  it('resolves using/using static/alias/parent-namespace references to declaring files', () => {
+    const result = runCsFixture();
+    expect(result.status).toBe(0);
+    // Order (using Shop.Core.Domain), Calc (using static), Infra.cs declares
+    // Clock (alias target, nested block namespaces), AppSettings (parent
+    // namespace Shop.Api, no using), Money declares Currency referenced inside
+    // an interpolated-string hole. UnusedPolicy is only named in a comment and
+    // a string: no edge. GeneratedMarker lives under obj/: no edge. Guard is
+    // reachable only via Shop.Core's global using, which does not apply to
+    // Shop.Api: no edge.
+    expect(result.output.importMap['Shop.Api/Controllers/OrdersController.cs']).toEqual([
+      'Shop.Api/AppSettings.cs',
+      'Shop.Core/Domain/Money.cs',
+      'Shop.Core/Domain/Order.cs',
+      'Shop.Core/Infra.cs',
+      'Shop.Core/Math/Calc.cs',
+    ]);
+  });
+
+  it('links same-namespace types and project-scoped global usings', () => {
+    const result = runCsFixture();
+    expect(result.status).toBe(0);
+    // Money: same file-scoped namespace, no using. Guard: global using in the
+    // same project. Strings/comments mentioning IUnusedPolicy do not count.
+    expect(result.output.importMap['Shop.Core/Domain/Order.cs']).toEqual([
+      'Shop.Core/Common/Guard.cs',
+      'Shop.Core/Domain/Money.cs',
+    ]);
+  });
+
+  it('never links unreferenced types, self, or generated files', () => {
+    const result = runCsFixture();
+    expect(result.status).toBe(0);
+    const map = result.output.importMap;
+    for (const [src, targets] of Object.entries(map)) {
+      expect(targets).not.toContain(src);
+      expect(targets).not.toContain('Shop.Core/Domain/UnusedPolicy.cs');
+      expect(targets).not.toContain('Shop.Api/obj/Debug/net8.0/Shop.Api.AssemblyInfo.cs');
+      expect(targets).not.toContain('Shop.Core/Migrations/20240101_Init.Designer.cs');
+    }
+    expect(map['Shop.Core/Infra.cs']).toEqual([]);
+    expect(map['Shop.Core/Domain/Money.cs']).toEqual([]);
+    expect(map['Shop.Core/GlobalUsings.cs']).toEqual([]);
+    expect(map['Shop.Api/obj/Debug/net8.0/Shop.Api.AssemblyInfo.cs']).toEqual([]);
+    expect(map['Shop.Core/Migrations/20240101_Init.Designer.cs']).toEqual([]);
+    expect(result.output.stats).toEqual({ filesScanned: 14, filesWithImports: 2, totalEdges: 7 });
+  });
+
+  it('builds the namespace index from the full inventory when analysisPaths is narrowed', () => {
+    const result = runCsFixture({ analysisPaths: ['Shop.Core/Domain/Order.cs'] });
+    expect(result.status).toBe(0);
+    expect(result.output.importMap).toEqual({
+      'Shop.Core/Domain/Order.cs': ['Shop.Core/Common/Guard.cs', 'Shop.Core/Domain/Money.cs'],
+    });
   });
 });
 

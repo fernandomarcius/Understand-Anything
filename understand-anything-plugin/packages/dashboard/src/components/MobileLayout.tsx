@@ -4,6 +4,8 @@ import { useDashboardStore } from "../store";
 import { useI18n } from "../contexts/I18nContext";
 import GraphView from "./GraphView";
 import DomainGraphView from "./DomainGraphView";
+import ServicesGraphView from "./ServicesGraphView";
+import { useAvailableViewModes } from "./ViewModeToggle";
 import KnowledgeGraphView from "./KnowledgeGraphView";
 import SearchBar from "./SearchBar";
 import NodeInfo from "./NodeInfo";
@@ -46,6 +48,7 @@ export default function MobileLayout({
   const persona = useDashboardStore((s) => s.persona);
   const viewMode = useDashboardStore((s) => s.viewMode);
   const domainGraph = useDashboardStore((s) => s.domainGraph);
+  const viewModes = useAvailableViewModes();
   const codeViewerOpen = useDashboardStore((s) => s.codeViewerOpen);
   const closeCodeViewer = useDashboardStore((s) => s.closeCodeViewer);
   const pathFinderOpen = useDashboardStore((s) => s.pathFinderOpen);
@@ -163,6 +166,8 @@ export default function MobileLayout({
             <KnowledgeGraphView />
           ) : viewMode === "domain" && domainGraph ? (
             <DomainGraphView />
+          ) : viewMode === "services" && viewModes.includes("services") ? (
+            <ServicesGraphView />
           ) : (
             <GraphView />
           )}

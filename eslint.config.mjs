@@ -17,6 +17,8 @@ export default tseslint.config(
       '**/.copilot-plugin/**',
       '**/.astro/**',
       '.private/**',
+      // synthetic multi-language member trees parsed by extract-contracts tests
+      'tests/skill/understand/fixtures/contracts/**',
     ],
   },
   eslint.configs.recommended,

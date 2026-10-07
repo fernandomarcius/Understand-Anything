@@ -1,0 +1,2 @@
+REACT_APP_API_GESTAO=http://172.16.50.47:8082/api
+REACT_APP_APIM_KEY=supersecret-apim

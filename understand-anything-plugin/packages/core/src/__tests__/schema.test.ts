@@ -834,3 +834,55 @@ describe("kind-aware alias normalization", () => {
     expect(res.data!.edges.some((e) => e.source === "screen:1:2" && e.type === "uses_token")).toBe(true);
   });
 });
+
+describe("project.workspace metadata (multi-repo workspace)", () => {
+  const workspace = {
+    name: "cloudbi",
+    members: [
+      {
+        name: "brain",
+        path: "../CSF_CLOUDBI_BRAIN",
+        gitCommitHash: "a".repeat(40),
+        analyzedAt: "2026-10-01T00:00:00.000Z",
+        nodes: 12,
+        edges: 34,
+      },
+      {
+        name: "motor",
+        path: "../CSF_CLOUDBI_MOTOR_CALCULO",
+        gitCommitHash: "b".repeat(40),
+        analyzedAt: "2026-10-02T00:00:00.000Z",
+        nodes: 5,
+        edges: 0,
+      },
+    ],
+  };
+
+  function workspaceGraph(ws: unknown = workspace) {
+    return {
+      ...validGraph,
+      project: { ...validGraph.project, gitCommitHash: "ws:" + "c".repeat(40), workspace: ws },
+    };
+  }
+
+  it("keeps project.workspace through validateGraph", () => {
+    const res = validateGraph(workspaceGraph());
+    expect(res.success).toBe(true);
+    expect(res.data!.project.workspace).toEqual(workspace);
+  });
+
+  it("validates non-workspace graphs exactly as before (no workspace key added)", () => {
+    const res = validateGraph(validGraph);
+    expect(res.success).toBe(true);
+    expect(res.data!.project).toEqual(validGraph.project);
+    expect("workspace" in res.data!.project).toBe(false);
+  });
+
+  it("rejects a malformed workspace block as invalid project metadata", () => {
+    const res = validateGraph(
+      workspaceGraph({ name: "cloudbi", members: [{ name: "brain", path: 1 }] }),
+    );
+    expect(res.success).toBe(false);
+    expect(res.fatal).toBe("Missing or invalid project metadata");
+  });
+});

@@ -304,6 +304,155 @@ def normalize_complexity(value: Any) -> tuple[str, str]:
     return "moderate", "unknown"
 
 
+# ── Node type / lineRange normalization ───────────────────────────────────
+#
+# LLM file-analyzers occasionally put prose (e.g. the summary) in `type`, or
+# emit `lineRange` as "12-40" / {start, end} instead of the `[start, end]`
+# tuple the core schema requires. The dashboard drops such nodes — and every
+# edge touching them — so repair them here.
+
+# A bogus `type` that contains spaces is treated as misplaced prose and moved
+# into `summary` when the existing summary is shorter than this.
+_SHORT_SUMMARY_CHARS = 20
+
+_LINE_NUM = r"L?\s*(\d+)"
+_LINE_RANGE_STR_RE = re.compile(
+    rf"^{_LINE_NUM}\s*(?:-|–|—|\.\.\.?|:|to)\s*{_LINE_NUM}$", re.IGNORECASE
+)
+_LINE_SINGLE_STR_RE = re.compile(rf"^{_LINE_NUM}$", re.IGNORECASE)
+
+_LINE_RANGE_OBJECT_KEYS: tuple[tuple[str, str], ...] = (
+    ("start", "end"),
+    ("startLine", "endLine"),
+)
+
+
+def _line_number(value: Any) -> int | float | None:
+    """A single line number from an int/float or a numeric ("12"/"L12") string."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        m = _LINE_SINGLE_STR_RE.match(value.strip())
+        return int(m.group(1)) if m else None
+    return None
+
+
+def _short_repr(value: Any, *, limit: int = 60, quote: bool = False) -> str:
+    """Compact, hashable report label for an arbitrary JSON value."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = repr(value)
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return f'"{text}"' if quote and isinstance(value, str) else text
+
+
+def normalize_line_range(value: Any) -> tuple[list[int | float] | None, str]:
+    """Normalize a `lineRange` value to `[start, end]`. Returns (value, status).
+
+    status is "valid" (unchanged), "unparseable" (value is None — drop the
+    field), or a human-readable label of the correction applied.
+    """
+    pair: list[Any] | None = None
+    label = ""
+
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        a, b = value
+        if all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (a, b)):
+            pair = [a, b]
+            label = "valid"
+        else:
+            na, nb = _line_number(a), _line_number(b)
+            if na is not None and nb is not None:
+                pair, label = [na, nb], "numeric strings → integers"
+    elif isinstance(value, str):
+        text = value.strip()
+        m = _LINE_RANGE_STR_RE.match(text)
+        if m:
+            pair, label = [int(m.group(1)), int(m.group(2))], 'string "a-b" → [start, end]'
+        else:
+            n = _line_number(text)
+            if n is not None:
+                pair, label = [n, n], "single number → [n, n]"
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        n = _line_number(value)
+        if n is not None:
+            pair, label = [n, n], "single number → [n, n]"
+    elif isinstance(value, dict):
+        for start_key, end_key in _LINE_RANGE_OBJECT_KEYS:
+            if start_key in value and end_key in value:
+                na, nb = _line_number(value[start_key]), _line_number(value[end_key])
+                if na is not None and nb is not None:
+                    pair, label = [na, nb], f"{{{start_key}, {end_key}}} object → [start, end]"
+                break
+
+    if pair is None:
+        return None, "unparseable"
+
+    if pair[0] > pair[1]:
+        pair = [pair[1], pair[0]]
+        label = "reversed → swapped" if label == "valid" else f"{label} (reversed, swapped)"
+
+    return pair, label
+
+
+def _id_type_prefix(node_id: Any) -> str | None:
+    """The valid node type named by an ID's prefix, if any.
+
+    Uses the text before the first `:`; also understands the
+    `<project>:<type>:...` shape that normalize_node_id strips.
+    """
+    if not isinstance(node_id, str) or ":" not in node_id:
+        return None
+    first = node_id.split(":", 1)[0]
+    if first not in TYPE_TO_PREFIX:
+        match = _PROJECT_PREFIX_RE.match(node_id)
+        if not match:
+            return None
+        first = match.group(1)
+    return TYPE_TO_PREFIX.get(first)
+
+
+def normalize_node_type(node: dict[str, Any]) -> tuple[list[str], bool]:
+    """Repair an invalid `type` in place. Returns (fix_labels, still_invalid).
+
+    Absent/empty types are left alone (not this function's concern).
+    """
+    node_type = node.get("type")
+    if not node_type or (isinstance(node_type, str) and node_type in TYPE_TO_PREFIX):
+        return [], False
+
+    fixes: list[str] = []
+    if isinstance(node_type, str):
+        lowered = node_type.strip().lower()
+        if lowered in TYPE_TO_PREFIX:
+            node["type"] = lowered
+            return ["node type wrong case → lowercased"], False
+
+        summary = node.get("summary")
+        if " " in node_type.strip() and (
+            not isinstance(summary, str) or len(summary.strip()) < _SHORT_SUMMARY_CHARS
+        ):
+            node["summary"] = node_type.strip()
+            fixes.append("node type held prose → moved into summary")
+
+    derived = _id_type_prefix(node.get("id"))
+    if derived is not None:
+        node["type"] = derived
+        fixes.append(f"invalid node type → \"{derived}\" (from id prefix)")
+        return fixes, False
+
+    return fixes, True
+
+
 # ── Deterministic tested_by linker ────────────────────────────────────────
 #
 # Two-pass linker. Both passes produce canonical `production → test` edges.
@@ -816,6 +965,8 @@ def merge_and_normalize(
     # ── Pattern counters for "Fixed" report ──────────────────────────
     id_fix_patterns: Counter[str] = Counter()
     complexity_fix_patterns: Counter[str] = Counter()
+    type_fix_patterns: Counter[str] = Counter()
+    line_range_fix_patterns: Counter[str] = Counter()
 
     # ── Detail lists for "Could not fix" report ──────────────────────
     unfixable: list[str] = []
@@ -841,10 +992,12 @@ def merge_and_normalize(
             unfixable.append(f"Node[{i}] has no 'id' field (name={node.get('name', '?')}, type={node.get('type', '?')})")
             continue
 
-        # Flag unknown node types
-        node_type = node.get("type", "")
-        if node_type and node_type not in TYPE_TO_PREFIX:
-            unknown_node_types[node_type] += 1
+        # Repair invalid node types (before ID normalization, which reads
+        # `type` for bare IDs); flag the ones that cannot be repaired.
+        type_fixes, type_still_invalid = normalize_node_type(node)
+        type_fix_patterns.update(type_fixes)
+        if type_still_invalid:
+            unknown_node_types[_short_repr(node.get("type"))] += 1
 
         nodes_with_ids.append(node)
         corrected_id = normalize_node_id(original_id, node)
@@ -856,6 +1009,7 @@ def merge_and_normalize(
 
     # ── Step 3: Normalize complexity ─────────────────────────────────
     complexity_unknown_patterns: Counter[str] = Counter()
+    line_range_unparseable: Counter[str] = Counter()
 
     for node in nodes_with_ids:
         original = node.get("complexity")
@@ -869,6 +1023,20 @@ def merge_and_normalize(
             complexity_unknown_patterns[f"complexity {orig_repr} → defaulted to \"moderate\""] += 1
 
         node["complexity"] = normalized
+
+        # lineRange: coerce to the [start, end] tuple the core schema requires.
+        # Absent or null is left alone (null is optional-cleared by core).
+        if node.get("lineRange") is not None:
+            raw_range = node["lineRange"]
+            fixed_range, range_status = normalize_line_range(raw_range)
+            if range_status == "unparseable":
+                del node["lineRange"]
+                line_range_unparseable[
+                    f"lineRange {_short_repr(raw_range, quote=True)} unparseable → field removed"
+                ] += 1
+            elif range_status != "valid":
+                node["lineRange"] = fixed_range
+                line_range_fix_patterns[range_status] += 1
 
     # ── Step 4: Rewrite edge references ──────────────────────────────
     edges_rewritten = 0
@@ -950,6 +1118,10 @@ def merge_and_normalize(
     if complexity_fix_patterns:
         for pattern, count in complexity_fix_patterns.most_common():
             fixed_lines.append(f"  {count:>4} × complexity {pattern}")
+    for pattern, count in type_fix_patterns.most_common():
+        fixed_lines.append(f"  {count:>4} × {pattern}")
+    for pattern, count in line_range_fix_patterns.most_common():
+        fixed_lines.append(f"  {count:>4} × lineRange {pattern}")
     if edges_rewritten:
         fixed_lines.append(f"  {edges_rewritten:>4} × edge references rewritten after ID normalization")
     if duplicate_count:
@@ -964,6 +1136,8 @@ def merge_and_normalize(
         total_fixes = (
             sum(id_fix_patterns.values())
             + sum(complexity_fix_patterns.values())
+            + sum(type_fix_patterns.values())
+            + sum(line_range_fix_patterns.values())
             + edges_rewritten
             + duplicate_count
             + tested_by_swapped
@@ -985,6 +1159,7 @@ def merge_and_normalize(
         len(unfixable)
         + sum(complexity_unknown_patterns.values())
         + sum(unknown_node_types.values())
+        + sum(line_range_unparseable.values())
     )
     if unfixable_total:
         report.append("")
@@ -994,6 +1169,8 @@ def merge_and_normalize(
             report.append(f"  {count:>4} × unknown node type \"{ntype}\" (not in schema, kept as-is)")
         # Unknown complexity patterns (grouped by count)
         for pattern, count in complexity_unknown_patterns.most_common():
+            report.append(f"  {count:>4} × {pattern}")
+        for pattern, count in line_range_unparseable.most_common():
             report.append(f"  {count:>4} × {pattern}")
         # Individual unfixable items
         for detail in unfixable:

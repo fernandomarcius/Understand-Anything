@@ -178,6 +178,28 @@ An interactive web dashboard opens with your codebase visualized as a graph — 
 /understand src/frontend
 ```
 
+### Multi-repo workspace (microservices)
+
+Services that live in separate repositories can be analyzed as **one** graph. Create a `ua-workspace.json` in any directory (it does not need to be a git repository); member paths are relative to it:
+
+```json
+{
+  "name": "shop",
+  "members": [
+    { "name": "orders", "path": "../orders-service" },
+    { "name": "billing", "path": "../billing-service" }
+  ]
+}
+```
+
+Then, from that directory:
+
+```bash
+/understand --workspace
+```
+
+Each member is analyzed with its own incremental pipeline in its own `.ua/` (members already up to date at their current commit are skipped with no LLM calls), the member graphs are merged deterministically into `.ua/knowledge-graph.json` at the workspace root, and the dashboard opens on the result — IDs are namespaced per member (`file:orders/src/app.ts`), source files open from every repository, and the freshness banner names the members that are behind. `--language` and `--exclude` are forwarded to every member. Full contract: [docs/multi-repo-workspace.md](docs/multi-repo-workspace.md).
+
 ---
 
 ## 🌐 Multi-Platform Installation

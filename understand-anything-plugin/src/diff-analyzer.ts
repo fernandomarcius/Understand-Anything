@@ -1,8 +1,11 @@
-import type {
-  KnowledgeGraph,
-  GraphNode,
-  GraphEdge,
-  Layer,
+import {
+  buildCrossServiceImpact,
+  formatCrossServiceImpact,
+  type KnowledgeGraph,
+  type GraphNode,
+  type GraphEdge,
+  type Layer,
+  type CrossServiceImpact,
 } from "@understand-anything/core";
 
 export interface DiffContext {
@@ -13,6 +16,12 @@ export interface DiffContext {
   impactedEdges: GraphEdge[];
   affectedLayers: Layer[];
   unmappedFiles: string[];
+  /**
+   * Multi-repo workspace only (null otherwise): endpoints, channels and shared
+   * tables reached from the changed files, with consumers in other services.
+   * In a workspace, `changedFiles` are namespaced `<member>/<path>`.
+   */
+  crossService: CrossServiceImpact | null;
 }
 
 /**
@@ -84,6 +93,7 @@ export function buildDiffContext(
     impactedEdges,
     affectedLayers,
     unmappedFiles,
+    crossService: buildCrossServiceImpact(graph, changedFiles),
   };
 }
 
@@ -155,6 +165,10 @@ export function formatDiffAnalysis(ctx: DiffContext): string {
     lines.push("");
   }
 
+  if (ctx.crossService) {
+    lines.push(formatCrossServiceImpact(ctx.crossService));
+  }
+
   lines.push("## Risk Assessment");
   lines.push("");
   const complexChanges = ctx.changedNodes.filter(
@@ -182,7 +196,15 @@ export function formatDiffAnalysis(ctx: DiffContext): string {
       `- **New/unmapped files**: ${ctx.unmappedFiles.length} files not in the knowledge graph (may need re-analysis)`,
     );
   }
+  const crossConsumers = ctx.crossService?.consumerNodeIds.length ?? 0;
+  const crossMembers = ctx.crossService?.affectedMembers ?? [];
+  if (crossMembers.length > 0) {
+    lines.push(
+      `- **Cross-service impact**: ${crossConsumers} consumer file(s) in ${crossMembers.length} other service(s): ${crossMembers.join(", ")}`,
+    );
+  }
   if (
+    crossMembers.length === 0 &&
     complexChanges.length === 0 &&
     crossLayerCount <= 1 &&
     ctx.affectedNodes.length <= 5 &&

@@ -3,6 +3,12 @@ import { useDashboardStore } from "../store";
 import { useI18n } from "../contexts/I18nContext";
 import { complexityLabel, nodeTypeLabel } from "../utils/i18nLabels";
 import type { NodeType, EdgeType, KnowledgeGraph, GraphNode } from "@understand-anything/core/types";
+import {
+  getEndpointConsumers,
+  getWorkspaceMemberNames,
+  memberOfNode,
+} from "@understand-anything/core/workspace";
+import { fillTemplate, memberColor } from "../utils/workspace";
 
 // Badge color classes keyed by NodeType — must be kept in sync with core NodeType union.
 const typeBadgeColors: Record<NodeType, string> = {
@@ -276,6 +282,55 @@ function DomainNodeDetails({ node, graph }: { node: GraphNode; graph: KnowledgeG
   return null;
 }
 
+/** Endpoint of a workspace graph: files of OTHER services calling it, with file:line evidence. */
+function EndpointConsumers({ node, graph }: { node: GraphNode; graph: KnowledgeGraph }) {
+  const navigateToNode = useDashboardStore((s) => s.navigateToNode);
+  const { t } = useI18n();
+  const consumers = getEndpointConsumers(graph, node.id);
+
+  return (
+    <div className="mb-4" data-testid="endpoint-consumers">
+      <h3 className="text-[11px] font-semibold text-gold uppercase tracking-wider mb-2">
+        {t.services.consumers} ({consumers.length})
+      </h3>
+      {consumers.length === 0 ? (
+        <p className="text-[11px] text-text-muted">{t.services.noConsumers}</p>
+      ) : (
+        <div className="space-y-1.5">
+          {consumers.map((c) => {
+            const consumerNode = graph.nodes.find((n) => n.id === c.nodeId);
+            const meta = [
+              c.via,
+              typeof c.confidence === "number"
+                ? fillTemplate(t.services.confidence, { value: Number(c.confidence.toFixed(2)) })
+                : null,
+            ]
+              .filter(Boolean)
+              .join(" · ");
+            return (
+              <div
+                key={`${c.nodeId}|${c.evidence ?? ""}`}
+                className="text-xs bg-elevated rounded-lg px-3 py-2 border border-border-subtle cursor-pointer hover:border-gold/40 hover:bg-gold/5 transition-colors"
+                onClick={() => navigateToNode(c.nodeId)}
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: memberColor(c.member) }} />
+                  <span className="text-text-muted shrink-0">{c.member}</span>
+                  <span className="text-text-primary truncate">{consumerNode?.name ?? c.nodeId}</span>
+                </div>
+                <div className="font-mono text-[10px] text-text-secondary mt-1 truncate" title={c.evidence ?? c.filePath}>
+                  {c.evidence ?? c.filePath ?? c.nodeId}
+                </div>
+                {meta && <div className="text-[10px] text-text-muted mt-0.5">{meta}</div>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function NodeInfo() {
   const graph = useDashboardStore((s) => s.graph);
   const selectedNodeId = useDashboardStore((s) => s.selectedNodeId);
@@ -326,6 +381,10 @@ export default function NodeInfo() {
   const childNodes = childEdges
     .map((e) => activeGraph?.nodes.find((n) => n.id === e.target))
     .filter((n): n is GraphNode => n !== undefined);
+
+  // Multi-repo workspace: which member (service) owns this node.
+  const workspaceMembers = activeGraph === graph ? getWorkspaceMemberNames(graph) : [];
+  const member = workspaceMembers.length > 0 ? memberOfNode(node, workspaceMembers) : null;
 
   const knownType = node.type as NodeType;
   const typeBadge = typeBadgeColors[knownType] ?? typeBadgeColors.file;
@@ -384,6 +443,17 @@ export default function NodeInfo() {
         >
           {complexityLabel(t, node.complexity)}
         </span>
+        {member && (
+          <span
+            className="text-[10px] font-semibold px-2 py-0.5 rounded border flex items-center gap-1.5"
+            style={{ borderColor: `${memberColor(member)}66`, color: memberColor(member) }}
+            title={t.services.member}
+            data-testid="node-member"
+          >
+            <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: memberColor(member) }} />
+            {member}
+          </span>
+        )}
       </div>
 
       <div className="flex items-center justify-between mb-2">
@@ -483,6 +553,11 @@ export default function NodeInfo() {
       {/* Domain-specific details */}
       {activeGraph && node && (node.type === "domain" || node.type === "flow" || node.type === "step") && (
         <DomainNodeDetails node={node} graph={activeGraph} />
+      )}
+
+      {/* Workspace endpoint: consumers in other services */}
+      {activeGraph && workspaceMembers.length > 0 && node.type === "endpoint" && (
+        <EndpointConsumers node={node} graph={activeGraph} />
       )}
 
       {/* Child classes/functions within this file */}

@@ -8,6 +8,8 @@ argument-hint: "[project-path]"
 
 Start the Understand Anything dashboard to visualize the knowledge graph for the current project.
 
+A multi-repo workspace root (the directory with `ua-workspace.json`, after `/understand --workspace`) works the same way: pass it as the project path. Its `.ua/knowledge-graph.json` is the merged workspace graph; the dashboard serves source files from every member (`<member>/<path>`) and reports freshness per member, listing the stale ones by name. No extra flag is needed.
+
 ## Instructions
 
 1. Determine the project directory and data directory:

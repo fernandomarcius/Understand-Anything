@@ -28,6 +28,46 @@ The knowledge graph JSON has this structure:
 3. Node names and summaries are the most useful fields for understanding
 4. Edges tell you how components connect — follow imports and calls for dependency chains
 
+## Workspace mode (multi-repo graphs)
+
+When the graph's `project` section has a `workspace` block (a graph merged by
+`/understand --workspace`, see `docs/multi-repo-workspace.md`), node ids and
+`filePath`s are namespaced per member: `file:<M>/<path>`, `filePath: "<M>/<path>"`.
+The workspace root is usually not a git repository, so the diff comes from each
+member instead. Follow the normal instructions below with these changes:
+
+1. **Members** — read `project.workspace.members[]` (`name`, `path` relative to the
+   workspace root). The user may restrict the analysis to one member (`/understand-diff <member>`).
+2. **Changed files per member** — run git *inside each member root*, never at the workspace root:
+   ```bash
+   git -C "<workspaceRoot>/<member.path>" diff --name-status -M <base>...HEAD
+   git -C "<workspaceRoot>/<member.path>" diff --name-only
+   git -C "<workspaceRoot>/<member.path>" diff --cached --name-only
+   ```
+   Paths are relative to that member. For renames/deletions (`R`/`D` in `--name-status`)
+   keep the **old** path too: it is how an endpoint whose route moved away is found.
+   Freshness (step 3) is per member: compare `git -C <member> rev-parse HEAD` with
+   `members[].gitCommitHash`, and warn per stale member.
+3. **Map to graph ids** — prefix every path with its member: `<M>/<path>` is the `filePath`
+   to grep; node ids are `<type>:<M>/<path>[:symbol]`. Never match a bare path across members.
+4. **Cross-service impact (deterministic)** — write the changes to a temp file as
+   `{ "<member>": ["path", ...] }` and run, from the plugin root:
+   ```bash
+   node skills/understand-diff/cross-service-impact.mjs "<workspaceRoot>" --changes <changes.json> --overlay --base <base>
+   ```
+   It prints a `## Cross-Service Impact` section: endpoints whose provider file changed with
+   their consumers in OTHER members (`M/file:line` evidence, `via`, confidence), calls from
+   changed files into other services, message channels (`concept:<system>/<channel>`) and
+   shared tables (`table:workspace/<schema.table>`) touched with the other services on them.
+   `--overlay` writes `$UA_DIR/diff-overlay.json` (step 8) with `"workspace": true` and
+   `crossServiceNodeIds` (also included in `affectedNodeIds`), so do not write it by hand.
+   Use `--json` instead of Markdown when you need the raw structure.
+5. **Report** — add a section "Cross-Service Impact" (written in the user's language, e.g.
+   "Impacto entre serviços") right after "Affected Layers": per affected endpoint, list the
+   consumer files in other services with `file:line`; then channels and tables touched; and
+   name every other service that must be re-tested. Treat consumers with confidence < 0.7 as
+   "probable". In the Risk Assessment, a non-empty cross-service impact is always a risk item.
+
 ## Instructions
 
 1. **Resolve the data directory `$UA_DIR`.** Run `UA_DIR=$([ -d .understand-anything ] && echo .understand-anything || echo .ua)` — this is the legacy `.understand-anything/` when it already exists, otherwise the new `.ua/`. Check that `$UA_DIR/knowledge-graph.json` exists. If not, tell the user to run `/understand` first.
@@ -82,4 +122,5 @@ The knowledge graph JSON has this structure:
      "affectedNodeIds": ["<node IDs from step 5, excluding changedNodeIds>"]
    }
    ```
+   In workspace mode the overlay is produced by `cross-service-impact.mjs --overlay` (Workspace mode, step 4); it adds `"workspace": true` and `"crossServiceNodeIds"` (consumers in other services, highlighted separately by the dashboard).
    After writing, tell the user they can run `/understand-anything:understand-dashboard` to see the diff overlay visually.

@@ -47,11 +47,41 @@ export type GraphFreshnessResult =
       lastAnalyzedAt?: string;
     };
 
+export type WorkspaceMemberUnknownReason =
+  | "missing-graph-commit"
+  | "member-path-missing"
+  | "git-head-unavailable"
+  | "git-command-timeout";
+
+/** Mirrors `WorkspaceMemberFreshness` from core `staleness.ts`. */
+export type WorkspaceMemberFreshness =
+  | {
+      name: string;
+      path: string;
+      status: "fresh" | "stale";
+      graphCommitHash: string;
+      headCommitHash: string;
+    }
+  | {
+      name: string;
+      path: string;
+      status: "unknown";
+      reason: WorkspaceMemberUnknownReason;
+      graphCommitHash: string;
+    };
+
+export interface WorkspaceFreshnessReport {
+  name: string;
+  members: WorkspaceMemberFreshness[];
+}
+
 export interface DashboardFreshnessReport {
   graphs: {
     knowledge: GraphFreshnessResult;
     domain?: GraphFreshnessResult;
   };
+  /** Present only for multi-repo workspace graphs (per-member freshness). */
+  workspace?: WorkspaceFreshnessReport;
 }
 
 const UNKNOWN_REASONS = new Set<GraphFreshnessUnknownReason>([
@@ -60,6 +90,13 @@ const UNKNOWN_REASONS = new Set<GraphFreshnessUnknownReason>([
   "graph-commit-unavailable",
   "git-command-timeout",
   "freshness-request-failed",
+]);
+
+const WORKSPACE_UNKNOWN_REASONS = new Set<WorkspaceMemberUnknownReason>([
+  "missing-graph-commit",
+  "member-path-missing",
+  "git-head-unavailable",
+  "git-command-timeout",
 ]);
 
 const RELATIONS = new Set<GraphFreshnessRelation>([
@@ -146,15 +183,49 @@ export function isGraphFreshnessResult(
   return false;
 }
 
+function isWorkspaceMemberFreshness(
+  value: unknown,
+): value is WorkspaceMemberFreshness {
+  if (
+    !isRecord(value) ||
+    typeof value.name !== "string" ||
+    typeof value.path !== "string" ||
+    typeof value.graphCommitHash !== "string"
+  ) {
+    return false;
+  }
+  if (value.status === "unknown") {
+    return (
+      typeof value.reason === "string" &&
+      WORKSPACE_UNKNOWN_REASONS.has(value.reason as WorkspaceMemberUnknownReason)
+    );
+  }
+  return (
+    (value.status === "fresh" || value.status === "stale") &&
+    isNonEmptyString(value.headCommitHash)
+  );
+}
+
+export function isWorkspaceFreshnessReport(
+  value: unknown,
+): value is WorkspaceFreshnessReport {
+  return (
+    isRecord(value) &&
+    typeof value.name === "string" &&
+    Array.isArray(value.members) &&
+    value.members.every(isWorkspaceMemberFreshness)
+  );
+}
+
 export function isDashboardFreshnessReport(
   value: unknown,
 ): value is DashboardFreshnessReport {
   if (!isRecord(value) || !isRecord(value.graphs)) return false;
   if (!isGraphFreshnessResult(value.graphs.knowledge)) return false;
-  return (
-    !("domain" in value.graphs) ||
-    isGraphFreshnessResult(value.graphs.domain)
-  );
+  if ("domain" in value.graphs && !isGraphFreshnessResult(value.graphs.domain)) {
+    return false;
+  }
+  return !("workspace" in value) || isWorkspaceFreshnessReport(value.workspace);
 }
 
 export function shouldRequestFreshness(

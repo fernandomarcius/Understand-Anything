@@ -8,13 +8,14 @@ import type {
   TourStep,
 } from "@understand-anything/core/types";
 import type { ReactFlowInstance } from "@xyflow/react";
+import { getWorkspaceMemberNames, memberOfId } from "@understand-anything/core/workspace";
 
 export type Persona = "non-technical" | "junior" | "experienced";
 export type NavigationLevel = "overview" | "layer-detail";
 export type NodeType = "file" | "function" | "class" | "module" | "concept" | "config" | "document" | "service" | "table" | "endpoint" | "pipeline" | "schema" | "resource" | "domain" | "flow" | "step" | "article" | "entity" | "topic" | "claim" | "source" | "page" | "screen" | "component" | "componentSet" | "instance" | "token";
 export type Complexity = "simple" | "moderate" | "complex";
 export type EdgeCategory = "structural" | "behavioral" | "data-flow" | "dependencies" | "semantic" | "infrastructure" | "domain" | "knowledge" | "design";
-export type ViewMode = "structural" | "domain" | "knowledge";
+export type ViewMode = "structural" | "domain" | "knowledge" | "services";
 export type DetailLevel = "file" | "class";
 
 export interface FilterState {
@@ -130,6 +131,15 @@ interface DashboardStore {
   diffMode: boolean;
   changedNodeIds: Set<string>;
   affectedNodeIds: Set<string>;
+  /** Workspace diff overlays: consumers in OTHER services (subset of affectedNodeIds). */
+  crossServiceNodeIds: Set<string>;
+
+  // Multi-repo workspace: members hidden from the structural view.
+  hiddenMembers: Set<string>;
+  toggleMemberVisibility: (member: string) => void;
+  showAllMembers: () => void;
+  /** Services view → structural view filtered to one member's namespace. */
+  drillIntoMember: (member: string) => void;
 
   // Focus mode: isolate a node's 1-hop neighborhood
   focusNodeId: string | null;
@@ -171,7 +181,7 @@ interface DashboardStore {
   expandCodeViewer: () => void;
   collapseCodeViewer: () => void;
 
-  setDiffOverlay: (changed: string[], affected: string[]) => void;
+  setDiffOverlay: (changed: string[], affected: string[], crossService?: string[]) => void;
   toggleDiffMode: () => void;
   clearDiffOverlay: () => void;
 
@@ -287,6 +297,14 @@ function layerResetIfChanged(
   };
 }
 
+/** Member visibility shifts container.nodeIds; drop cached layouts (see toggleNodeTypeFilter). */
+const CONTAINER_RESET = {
+  containerLayoutCache: new Map(),
+  containerSizeMemory: new Map(),
+  expandedContainers: new Set<string>(),
+  pendingFocusContainer: null,
+} as const;
+
 export const useDashboardStore = create<DashboardStore>()((set, get) => ({
   graph: null,
   nodesById: new Map<string, GraphNode>(),
@@ -313,6 +331,33 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
   diffMode: false,
   changedNodeIds: new Set<string>(),
   affectedNodeIds: new Set<string>(),
+  crossServiceNodeIds: new Set<string>(),
+
+  hiddenMembers: new Set<string>(),
+  toggleMemberVisibility: (member) =>
+    set((state) => {
+      const next = new Set(state.hiddenMembers);
+      if (next.has(member)) next.delete(member);
+      else next.add(member);
+      return { hiddenMembers: next, ...CONTAINER_RESET };
+    }),
+  showAllMembers: () => set({ hiddenMembers: new Set<string>(), ...CONTAINER_RESET }),
+  drillIntoMember: (member) => {
+    const members = getWorkspaceMemberNames(get().graph);
+    if (!members.includes(member)) return;
+    set({
+      hiddenMembers: new Set(members.filter((m) => m !== member)),
+      viewMode: "structural",
+      navigationLevel: "overview",
+      activeLayerId: null,
+      selectedNodeId: null,
+      focusNodeId: null,
+      codeViewerOpen: false,
+      codeViewerNodeId: null,
+      codeViewerExpanded: false,
+      ...CONTAINER_RESET,
+    });
+  },
 
   focusNodeId: null,
   nodeHistory: [],
@@ -383,8 +428,14 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
       selectedNodeId: null,
       focusNodeId: null,
       nodeHistory: [],
-      viewMode: keepDomainView ? "domain" as const : "structural" as const,
+      // Workspace graphs open on the service-level system view.
+      viewMode: keepDomainView
+        ? "domain" as const
+        : getWorkspaceMemberNames(graph).length > 0
+          ? "services" as const
+          : "structural" as const,
       activeDomainId: keepDomainView ? activeDomainId : null,
+      hiddenMembers: new Set<string>(),
       containerLayoutCache: new Map(),
       expandedContainers: new Set(),
       pendingFocusContainer: null,
@@ -412,8 +463,19 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
   },
 
   navigateToNodeInLayer: (nodeId) => {
-    const { graph, selectedNodeId, nodeHistory, nodeIdToLayerId, activeLayerId } = get();
+    const { graph, selectedNodeId, nodeHistory, nodeIdToLayerId, activeLayerId, viewMode, hiddenMembers } = get();
     if (!graph) return;
+    // A concrete node lives in the structural view; reveal its member if the
+    // member filter hides it.
+    const member = hiddenMembers.size > 0 ? memberOfId(nodeId, getWorkspaceMemberNames(graph)) : null;
+    if (viewMode === "services" || (member && hiddenMembers.has(member))) {
+      const nextHidden = new Set(hiddenMembers);
+      if (member) nextHidden.delete(member);
+      set({
+        viewMode: viewMode === "services" ? "structural" : viewMode,
+        hiddenMembers: nextHidden,
+      });
+    }
     const layerId = nodeIdToLayerId.get(nodeId) ?? null;
     const newHistory =
       selectedNodeId && nodeId !== selectedNodeId
@@ -561,11 +623,12 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
   expandCodeViewer: () => set({ codeViewerExpanded: true }),
   collapseCodeViewer: () => set({ codeViewerExpanded: false }),
 
-  setDiffOverlay: (changed, affected) =>
+  setDiffOverlay: (changed, affected, crossService = []) =>
     set({
       diffMode: true,
       changedNodeIds: new Set(changed),
-      affectedNodeIds: new Set(affected),
+      affectedNodeIds: new Set([...affected, ...crossService]),
+      crossServiceNodeIds: new Set(crossService),
     }),
 
   toggleDiffMode: () => set((state) => ({ diffMode: !state.diffMode })),
@@ -575,6 +638,7 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
       diffMode: false,
       changedNodeIds: new Set<string>(),
       affectedNodeIds: new Set<string>(),
+      crossServiceNodeIds: new Set<string>(),
     }),
 
   toggleFilterPanel: () => set((state) => ({
@@ -597,29 +661,33 @@ export const useDashboardStore = create<DashboardStore>()((set, get) => ({
     filters: { ...state.filters, ...newFilters },
   })),
 
-  resetFilters: () => set({
+  resetFilters: () => set((state) => ({
     filters: {
       nodeTypes: new Set<NodeType>(ALL_NODE_TYPES),
       complexities: new Set<Complexity>(ALL_COMPLEXITIES),
       layerIds: new Set<string>(),
       edgeCategories: new Set<EdgeCategory>(ALL_EDGE_CATEGORIES),
     },
-  }),
+    ...(state.hiddenMembers.size > 0 ? { hiddenMembers: new Set<string>(), ...CONTAINER_RESET } : {}),
+  })),
 
   hasActiveFilters: () => {
-    const { filters } = get();
+    const { filters, hiddenMembers } = get();
     return filters.nodeTypes.size !== ALL_NODE_TYPES.length
       || filters.complexities.size !== ALL_COMPLEXITIES.length
       || filters.layerIds.size > 0
-      || filters.edgeCategories.size !== ALL_EDGE_CATEGORIES.length;
+      || filters.edgeCategories.size !== ALL_EDGE_CATEGORIES.length
+      || hiddenMembers.size > 0;
   },
 
   startTour: () => {
-    const { graph, nodeIdToLayerId, activeLayerId } = get();
+    const { graph, nodeIdToLayerId, activeLayerId, viewMode } = get();
     if (!graph || !graph.tour || graph.tour.length === 0) return;
     const sorted = getSortedTour(graph);
     const layerNav = navigateTourToLayer(nodeIdToLayerId, sorted[0].nodeIds);
     set({
+      // The tour walks layers of the structural view.
+      ...(viewMode === "services" ? { viewMode: "structural" as const, hiddenMembers: new Set<string>() } : {}),
       tourActive: true,
       currentTourStep: 0,
       tourHighlightedNodeIds: sorted[0].nodeIds,

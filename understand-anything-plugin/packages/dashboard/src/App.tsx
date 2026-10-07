@@ -4,6 +4,9 @@ import type { GraphIssue } from "@understand-anything/core/schema";
 import { useDashboardStore } from "./store";
 import GraphView from "./components/GraphView";
 import DomainGraphView from "./components/DomainGraphView";
+import ServicesGraphView from "./components/ServicesGraphView";
+import ViewModeToggle, { useAvailableViewModes } from "./components/ViewModeToggle";
+import { parseDiffOverlay } from "./utils/workspace";
 import KnowledgeGraphView from "./components/KnowledgeGraphView";
 import SearchBar from "./components/SearchBar";
 import NodeInfo from "./components/NodeInfo";
@@ -254,18 +257,10 @@ function Dashboard({ accessToken }: { accessToken: string }) {
         return res.json();
       })
       .then((data: unknown) => {
-        if (
-          data &&
-          typeof data === "object" &&
-          "changedNodeIds" in data &&
-          "affectedNodeIds" in data &&
-          Array.isArray((data as Record<string, unknown>).changedNodeIds) &&
-          Array.isArray((data as Record<string, unknown>).affectedNodeIds)
-        ) {
-          const d = data as { changedNodeIds: string[]; affectedNodeIds: string[] };
-          if (d.changedNodeIds.length > 0) {
-            setDiffOverlay(d.changedNodeIds, d.affectedNodeIds);
-          }
+        // Workspace overlays add crossServiceNodeIds (consumers in other services).
+        const overlay = parseDiffOverlay(data);
+        if (overlay && overlay.changed.length > 0) {
+          setDiffOverlay(overlay.changed, overlay.affected, overlay.crossService);
         }
       })
       .catch(() => {});
@@ -340,7 +335,7 @@ function DashboardContent({
     setShowOnboarding(false);
   }, []);
   const viewMode = useDashboardStore((s) => s.viewMode);
-  const setViewMode = useDashboardStore((s) => s.setViewMode);
+  const viewModes = useAvailableViewModes();
   const isKnowledgeGraph = useDashboardStore((s) => s.isKnowledgeGraph);
   const domainGraph = useDashboardStore((s) => s.domainGraph);
   const layoutIssues = useDashboardStore((s) => s.layoutIssues);
@@ -539,35 +534,10 @@ function DashboardContent({
           </h1>
           <div className="w-px h-5 bg-border-subtle hidden sm:block" />
           <PersonaSelector />
-          {graph && !isKnowledgeGraph && domainGraph && (
+          {viewModes.length > 0 && (
             <>
               <div className="w-px h-5 bg-border-subtle" />
-              <div className="flex items-center bg-elevated rounded-lg p-0.5">
-                <button
-                  type="button"
-                  onClick={() => setViewMode("domain")}
-                  title={t.drawer.domain}
-                  className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-                    viewMode === "domain"
-                      ? "bg-accent/20 text-accent"
-                      : "text-text-muted hover:text-text-secondary"
-                  }`}
-                >
-                  {t.drawer.domain}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setViewMode("structural")}
-                  title={t.drawer.structural}
-                  className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
-                    viewMode === "structural"
-                      ? "bg-accent/20 text-accent"
-                      : "text-text-muted hover:text-text-secondary"
-                  }`}
-                >
-                  {t.drawer.structural}
-                </button>
-              </div>
+              <ViewModeToggle modes={viewModes} variant="header" />
             </>
           )}
         </div>
@@ -577,7 +547,7 @@ function DashboardContent({
           <div className="flex items-center gap-4 w-max">
             <DiffToggle />
             {/* Detail level: file view (architecture) / class view (code structure) */}
-            {!isKnowledgeGraph && viewMode !== "domain" && (
+            {!isKnowledgeGraph && viewMode !== "domain" && viewMode !== "services" && (
               <>
                 <div className="w-px h-5 bg-border-subtle" />
                 <div className="flex items-center bg-elevated rounded-lg p-0.5">
@@ -732,6 +702,8 @@ function DashboardContent({
             <KnowledgeGraphView />
           ) : viewMode === "domain" && domainGraph ? (
             <DomainGraphView />
+          ) : viewMode === "services" && viewModes.includes("services") ? (
+            <ServicesGraphView />
           ) : (
             <GraphView />
           )}

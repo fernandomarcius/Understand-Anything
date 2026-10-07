@@ -446,6 +446,20 @@ export const GraphEdgeSchema = z.object({
   direction: z.enum(["forward", "backward", "bidirectional"]),
   description: z.string().optional(),
   weight: z.number().min(0).max(1),
+  // Cross-service metadata written by the workspace contract linker. A
+  // malformed value is discarded (`catch`) instead of dropping the edge.
+  crossService: z.boolean().optional().catch(undefined),
+  confidence: z.number().optional().catch(undefined),
+  evidence: z
+    .object({
+      consumer: z.string().optional().catch(undefined),
+      provider: z.string().optional().catch(undefined),
+      via: z.string().optional().catch(undefined),
+    })
+    .passthrough()
+    .optional()
+    .catch(undefined),
+  callSites: z.number().int().nonnegative().optional().catch(undefined),
 });
 
 export const LayerSchema = z.object({
@@ -463,6 +477,20 @@ export const TourStepSchema = z.object({
   languageLesson: z.string().optional(),
 });
 
+export const WorkspaceMemberMetaSchema = z.object({
+  name: z.string(),
+  path: z.string(),
+  gitCommitHash: z.string(),
+  analyzedAt: z.string(),
+  nodes: z.number().int().nonnegative(),
+  edges: z.number().int().nonnegative(),
+});
+
+export const WorkspaceMetaSchema = z.object({
+  name: z.string(),
+  members: z.array(WorkspaceMemberMetaSchema),
+});
+
 export const ProjectMetaSchema = z.object({
   name: z.string(),
   languages: z.array(z.string()),
@@ -470,6 +498,8 @@ export const ProjectMetaSchema = z.object({
   description: z.string(),
   analyzedAt: z.string(),
   gitCommitHash: z.string(),
+  // Present only on multi-repo workspace graphs (see docs/multi-repo-workspace.md).
+  workspace: WorkspaceMetaSchema.optional(),
 });
 
 export const KnowledgeGraphSchema = z.object({

@@ -45,6 +45,57 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+const workspaceReport: DashboardFreshnessReport = {
+  graphs: {
+    knowledge: { status: "unknown", reason: "git-head-unavailable" },
+  },
+  workspace: {
+    name: "cloudbi",
+    members: [
+      {
+        name: "brain",
+        path: "../brain",
+        status: "fresh",
+        graphCommitHash: "a".repeat(40),
+        headCommitHash: "a".repeat(40),
+      },
+      {
+        name: "motor",
+        path: "../motor",
+        status: "stale",
+        graphCommitHash: "a".repeat(40),
+        headCommitHash: "b".repeat(40),
+      },
+      {
+        name: "docs",
+        path: "../docs",
+        status: "unknown",
+        reason: "git-head-unavailable",
+        graphCommitHash: "c".repeat(40),
+      },
+    ],
+  },
+};
+
+describe("isDashboardFreshnessReport with workspace members", () => {
+  it("accepts a well-formed per-member workspace report", () => {
+    expect(isDashboardFreshnessReport(workspaceReport)).toBe(true);
+  });
+
+  it("rejects malformed workspace members", () => {
+    const [fresh, stale, unknown] = workspaceReport.workspace!.members;
+    const withMembers = (members: unknown[]) => ({
+      ...workspaceReport,
+      workspace: { name: "cloudbi", members },
+    });
+    expect(isDashboardFreshnessReport(withMembers([{ ...stale, headCommitHash: undefined }]))).toBe(false);
+    expect(isDashboardFreshnessReport(withMembers([{ ...unknown, reason: "bogus" }]))).toBe(false);
+    expect(isDashboardFreshnessReport(withMembers([{ ...fresh, status: "dirty" }]))).toBe(false);
+    expect(isDashboardFreshnessReport(withMembers([{ ...fresh, name: 1 }]))).toBe(false);
+    expect(isDashboardFreshnessReport({ ...workspaceReport, workspace: { name: "x" } })).toBe(false);
+  });
+});
+
 describe("isDashboardFreshnessReport", () => {
   it("accepts complete fresh, dirty, stale, and unknown graph results", () => {
     expect(isDashboardFreshnessReport(freshReport)).toBe(true);

@@ -1,7 +1,7 @@
 ---
 name: understand
 description: Analyze a codebase to produce an interactive knowledge graph for understanding architecture, components, and relationships
-argument-hint: ["[path] [--full|--auto-update|--no-auto-update|--review|--language <lang>|--exclude <patterns>]"]
+argument-hint: ["[path] [--full|--auto-update|--no-auto-update|--review|--language <lang>|--exclude <patterns>|--workspace [dir]]"]
 ---
 
 # /understand
@@ -18,6 +18,45 @@ Analyze the current codebase and produce a `knowledge-graph.json` file in the pr
   - `--language <lang>` — Generate all textual content (summaries, descriptions, tags, titles, languageNotes, languageLesson) in the specified language. Accepts ISO 639-1 codes (`zh`, `ja`, `ko`, `en`, `es`, `fr`, `de`, etc.) or friendly names (`chinese`, `japanese`, `korean`, `english`, `spanish`, etc.). Locale variants supported: `zh-TW`, `zh-HK`, etc. Defaults to `en` (English). Stores preference in `$UA_DIR/config.json` for consistency across incremental updates.
   - `--exclude <patterns>` — Comma-separated glob patterns for additional files/directories to exclude from analysis (e.g., `--exclude "tests/*,docs/*"`). These patterns take highest priority over built-in defaults and `.understandignore` rules. Supports gitignore syntax including `!` negation.
   - A directory path (e.g. `/path/to/repo` or `../other-project`) — Analyze the given directory instead of the current working directory
+  - `--workspace [dir]` — Multi-repo workspace mode: analyze every repository listed in `<dir>/ua-workspace.json` (default: the current working directory) and merge them into one graph at `<dir>/.ua/`. See **Workspace mode** below; when this flag is present, follow that section instead of the phases below.
+
+---
+
+## Workspace mode (`--workspace [dir]`)
+
+Use this when `$ARGUMENTS` contains `--workspace`. It analyzes several repositories (typically microservices) as one knowledge graph. Each member keeps its own `.ua/` and its own incremental pipeline; the workspace graph is a deterministic, LLM-free merge. The full contract is in `docs/multi-repo-workspace.md` of the plugin repository. Without `--workspace`, ignore this section entirely — the single-repo flow below is unchanged.
+
+1. **Resolve the workspace root.** If the token right after `--workspace` exists and does not start with `--`, it is the workspace directory (resolve relative paths against the current working directory); otherwise use the current working directory. Verify it is a directory (`test -d`), else report an error and **STOP**. Store it as `$WORKSPACE_ROOT` (absolute). The root does not need to be a git repository.
+
+2. **Validate the manifest** (no LLM call, nothing written). Do Phase 0 step 1.5 first if the plugin is not built yet, then run the script bundled next to this SKILL.md:
+   ```bash
+   python3 "<SKILL_DIR>/merge-workspace-graphs.py" "$WORKSPACE_ROOT" --validate-only
+   ```
+   On a non-zero exit, show the error (it names the offending field) and **STOP**. On success it prints `{"name", "members": [{"name", "path", "dir"}]}`; `dir` is the resolved absolute member directory. Keep the members in this order.
+
+3. **Collect forwarded options.** From `$ARGUMENTS`, keep `--language <lang>`, `--exclude <patterns>` and `--full` (if present) as `$MEMBER_ARGS`. Exclude patterns apply relative to each member root. If `--language` is absent, each member keeps its stored `outputLanguage`; when a member has none, resolve the language once for the whole workspace (Phase 0 step 3.6 detection/confirmation, asked at most once) and pass it to every member that lacks a stored preference — never prompt once per member.
+
+4. **Run each member, in manifest order.** Report `[Workspace] Member i/N: <name> (<dir>)` before each one.
+   - **Skip fresh members with zero LLM calls** (unless `--full` was given). Resolve the member data dir (`.understand-anything/` if it exists, else `.ua/`). If `<member data dir>/knowledge-graph.json` exists **and** `<member data dir>/meta.json`'s `gitCommitHash` equals `git -C "<dir>" rev-parse HEAD`, report `<name>: up to date @ <short hash> — skipped` and go to the next member. Do not read sources, dispatch subagents or ask the "graph is up to date" question for it.
+   - **Otherwise run the normal `/understand` pipeline** (Phase 0 through Phase 7 below) with `PROJECT_ROOT=<dir>` and `$ARGUMENTS` = `$MEMBER_ARGS` (no `--workspace`, no other path). Everything — `$UA_DIR`, incremental decision, intermediate files, validation — is per member, exactly as for a single repository. Two differences only: in Phase 0 step 7, an unchanged commit hash means *skip this member* (never ask the user), and in Phase 7 step 6 do **not** launch the dashboard for the member.
+   - If a member fails (no graph saved), record the failure, keep going with the other members, and do not merge at the end — report which member failed and why.
+
+5. **Merge.** When every member has a graph:
+   ```bash
+   python3 "<SKILL_DIR>/merge-workspace-graphs.py" "$WORKSPACE_ROOT"
+   ```
+   It writes `$WORKSPACE_ROOT/.ua/knowledge-graph.json` and `meta.json` (plus `config.json` with the first member's `outputLanguage` when the workspace has none) and prints one line per member and a total. On a non-zero exit, show the error and **STOP** (nothing is written).
+
+6. **Workspace tour (system-level narrative).** The merge also writes `$WORKSPACE_ROOT/.ua/intermediate/workspace-tour-input.json`: members (description, languages, file count, top layers, `tourStart` = their tour step 1 node ids), `services.links` (member → member counts of `calls` / `messages` / `tables`), the top cross-service `contracts` (endpoints by consumers, channels, shared tables, each with namespaced node ids), a `nodes` index of every id it cites, `crossServiceLinks` and `outputLanguage`.
+   - **Skip** this step when `crossServiceLinks` is `0` (no linked contracts, or `--no-contracts`): there is no request to follow across services. Report `Workspace tour: skipped (no cross-service links)` and keep any existing `.ua/workspace-tour.json` as is.
+   - Otherwise report `[Workspace] Building the system tour...` and dispatch a subagent using the `tour-builder` agent definition (at `agents/tour-builder.md`), with the language directive for the input's `outputLanguage` and these parameters:
+     > Create a **workspace tour** (see "Workspace tour" in your instructions).
+     > Input: `$WORKSPACE_ROOT/.ua/intermediate/workspace-tour-input.json`
+     > Write output to: `$WORKSPACE_ROOT/.ua/workspace-tour.json`
+     > 5–10 steps that follow a request end-to-end across services (e.g. UI → API → queue → worker → data), using ONLY node ids that are keys of the input's `nodes` object.
+   - Then re-run the merge (zero LLM calls) so the tour lands in the graph: `python3 "<SKILL_DIR>/merge-workspace-graphs.py" "$WORKSPACE_ROOT"` (append `--no-contracts` only if step 5 used it). Its steps go first in `tour`, before the per-member tours; ids missing from the graph are dropped with a warning and `order` is renumbered. If the subagent fails, report it and keep the graph from step 5.
+
+7. **Report and launch.** Summarize: members analyzed vs skipped, per-member node/edge counts from the merge output, total, and the output path. Then launch the dashboard on the workspace root by invoking the `/understand-dashboard` skill with `$WORKSPACE_ROOT` as its argument. The dashboard opens files from every member and shows per-member freshness (stale members are listed by name).
 
 ---
 
