@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { useDashboardStore, ALL_NODE_TYPES, ALL_COMPLEXITIES, ALL_EDGE_CATEGORIES } from "../store";
 import type { NodeType, Complexity, EdgeCategory } from "../store";
 import { useI18n } from "../contexts/I18nContext";
+import { complexityLabel, edgeCategoryLabel, nodeTypeLabel } from "../utils/i18nLabels";
 import { getWorkspaceMemberNames } from "@understand-anything/core/workspace";
 import { memberColor } from "../utils/workspace";
 
@@ -89,7 +90,7 @@ export default function FilterPanel() {
             ? "bg-gold/20 text-gold hover:bg-gold/30"
             : "bg-elevated text-text-secondary hover:text-text-primary"
         }`}
-        title="Filter graph (F)"
+        title={t.filterPanel.title}
       >
         <svg
           className="w-4 h-4"
@@ -153,7 +154,7 @@ export default function FilterPanel() {
                       onChange={() => toggleNodeType(type)}
                       className="w-3.5 h-3.5 rounded border-border-subtle bg-elevated checked:bg-gold checked:border-gold focus:ring-0 focus:ring-offset-0 cursor-pointer"
                     />
-                    <span className="text-sm text-text-primary capitalize">{type}</span>
+                    <span className="text-sm text-text-primary capitalize">{nodeTypeLabel(t, type)}</span>
                   </label>
                 ))}
               </div>
@@ -176,7 +177,7 @@ export default function FilterPanel() {
                       onChange={() => toggleComplexity(complexity)}
                       className="w-3.5 h-3.5 rounded border-border-subtle bg-elevated checked:bg-gold checked:border-gold focus:ring-0 focus:ring-offset-0 cursor-pointer"
                     />
-                    <span className="text-sm text-text-primary capitalize">{complexity}</span>
+                    <span className="text-sm text-text-primary capitalize">{complexityLabel(t, complexity)}</span>
                   </label>
                 ))}
               </div>
@@ -226,7 +227,7 @@ export default function FilterPanel() {
                       className="w-3.5 h-3.5 rounded border-border-subtle bg-elevated checked:bg-gold checked:border-gold focus:ring-0 focus:ring-offset-0 cursor-pointer"
                     />
                     <span className="text-sm text-text-primary capitalize">
-                      {category.replace(/-/g, " ")}
+                      {edgeCategoryLabel(t, category)}
                     </span>
                   </label>
                 ))}

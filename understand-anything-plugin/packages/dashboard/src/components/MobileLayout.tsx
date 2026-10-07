@@ -91,7 +91,7 @@ export default function MobileLayout({
           type="button"
           onClick={() => setDrawerOpen(true)}
           className="w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-elevated transition-colors -ml-1"
-          aria-label="Open menu"
+          aria-label={t.ariaLabels.openMenu}
         >
           <svg
             className="w-5 h-5"
@@ -116,7 +116,7 @@ export default function MobileLayout({
               ? "text-accent bg-accent/15"
               : "text-text-secondary hover:text-text-primary hover:bg-elevated"
           }`}
-          aria-label={searchOpen ? "Hide search" : "Show search"}
+          aria-label={searchOpen ? t.ariaLabels.hideSearch : t.ariaLabels.showSearch}
           aria-pressed={searchOpen}
         >
           <svg

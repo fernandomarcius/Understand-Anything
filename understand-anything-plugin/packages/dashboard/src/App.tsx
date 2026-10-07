@@ -28,6 +28,7 @@ import { ThemeProvider } from "./themes/index.ts";
 import { ThemePicker } from "./components/ThemePicker.tsx";
 import type { ThemeConfig } from "./themes/index.ts";
 import { I18nProvider, useI18n } from "./contexts/I18nContext.tsx";
+import type { Locale } from "./locales";
 import {
   requestFreshnessReport,
   shouldRequestFreshness,
@@ -48,6 +49,28 @@ const DEMO_MODE = import.meta.env.VITE_DEMO_MODE === "true";
 const SESSION_TOKEN_KEY = "understand-anything-token";
 const ONBOARDING_DISMISSED_KEY = "ua-onboarding-dismissed-v1";
 type SidebarTab = "info" | "files";
+
+/** Load failures are stored structurally and localized at render time (inside I18nProvider). */
+type LoadError =
+  | { kind: "invalid"; detail: string }
+  | { kind: "unknown-validation" }
+  | { kind: "failed"; detail: string };
+
+function formatLoadError(t: Locale, error: LoadError | null): string | null {
+  if (!error) return null;
+  switch (error.kind) {
+    case "invalid":
+      return t.loadErrors.invalidGraph(error.detail);
+    case "unknown-validation":
+      return t.loadErrors.unknownValidation;
+    case "failed":
+      return t.loadErrors.loadFailed(error.detail);
+  }
+}
+
+function browserLanguage(): string | undefined {
+  return typeof navigator !== "undefined" ? navigator.language : undefined;
+}
 
 function shouldShowOnboarding(): boolean {
   if (typeof window === "undefined") return false;
@@ -112,7 +135,13 @@ function App() {
 
   // Show the token gate when no token is available
   if (accessToken === null) {
-    return <TokenGate onTokenValid={handleTokenValid} />;
+    // The token gate renders before config.json (and its outputLanguage) can be
+    // fetched, so it follows the browser language instead.
+    return (
+      <I18nProvider language={browserLanguage()}>
+        <TokenGate onTokenValid={handleTokenValid} />
+      </I18nProvider>
+    );
   }
 
   return <Dashboard accessToken={accessToken} />;
@@ -122,7 +151,7 @@ function Dashboard({ accessToken }: { accessToken: string }) {
   const setGraph = useDashboardStore((s) => s.setGraph);
   const setDomainGraph = useDashboardStore((s) => s.setDomainGraph);
   const setDiffOverlay = useDashboardStore((s) => s.setDiffOverlay);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<LoadError | null>(null);
   const [graphIssues, setGraphIssues] = useState<GraphIssue[]>([]);
   const [graphFreshness, setGraphFreshness] =
     useState<DashboardFreshnessReport | null>(null);
@@ -184,15 +213,18 @@ function Dashboard({ accessToken }: { accessToken: string }) {
           }
         } else if (result.fatal) {
           console.error("Knowledge graph validation failed:", result.fatal);
-          setLoadError(`Invalid knowledge graph: ${result.fatal}`);
+          setLoadError({ kind: "invalid", detail: result.fatal });
         } else {
           console.error("Knowledge graph validation failed: unknown error");
-          setLoadError("Invalid knowledge graph: unknown validation error");
+          setLoadError({ kind: "unknown-validation" });
         }
       })
       .catch((err) => {
         console.error("Failed to load knowledge graph:", err);
-        setLoadError(`Failed to load knowledge graph: ${err instanceof Error ? err.message : String(err)}`);
+        setLoadError({
+          kind: "failed",
+          detail: err instanceof Error ? err.message : String(err),
+        });
       });
   }, [setGraph]);
 
@@ -273,7 +305,7 @@ function DashboardContent({
   graphFreshness,
 }: {
   accessToken: string;
-  loadError: string | null;
+  loadError: LoadError | null;
   graphIssues: GraphIssue[];
   graphFreshness: DashboardFreshnessReport | null;
 }) {
@@ -309,6 +341,7 @@ function DashboardContent({
   const layoutIssues = useDashboardStore((s) => s.layoutIssues);
   const isMobile = useIsMobile();
   const { t } = useI18n();
+  const loadErrorMessage = formatLoadError(t, loadError);
   const allIssues = useMemo(
     () => [...graphIssues, ...layoutIssues],
     [graphIssues, layoutIssues],
@@ -482,7 +515,7 @@ function DashboardContent({
         accessToken={accessToken}
         showKeyboardHelp={showKeyboardHelp}
         setShowKeyboardHelp={setShowKeyboardHelp}
-        loadError={loadError}
+        loadError={loadErrorMessage}
         allIssues={allIssues}
         graphFreshness={graphFreshness}
         shortcuts={shortcuts}
@@ -579,7 +612,7 @@ function DashboardContent({
                       ? "border-border-medium bg-elevated text-text-secondary hover:text-text-primary"
                       : "border-transparent bg-transparent text-text-muted/40 line-through hover:text-text-muted"
                   }`}
-                  title={`${nodeTypeFilters[cat.key] !== false ? "Hide" : "Show"} ${cat.label} nodes`}
+                  title={`${nodeTypeFilters[cat.key] !== false ? t.nodeTypeFilter.hide : t.nodeTypeFilter.show} ${cat.label} ${t.nodeTypeFilter.nodesLabel}`}
                 >
                   <span
                     className="w-2 h-2 rounded-full shrink-0"
@@ -657,7 +690,7 @@ function DashboardContent({
       {/* Error banner */}
       {loadError && (
         <div className="px-5 py-3 bg-red-900/30 border-b border-red-700 text-red-200 text-sm">
-          {loadError}
+          {loadErrorMessage}
         </div>
       )}
 
